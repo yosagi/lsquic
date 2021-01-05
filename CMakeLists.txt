@@ -1,8 +1,7 @@
 # Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE.
-cmake_minimum_required(VERSION 2.8)
+cmake_minimum_required(VERSION 3.16)
 
-
-PROJECT(lsquic C)
+PROJECT(lsquic VERSION 2.27 LANGUAGES C )
 
 OPTION(LSQUIC_FIU "Use Fault Injection in Userspace (FIU)" OFF)
 OPTION(LSQUIC_BIN "Compile example binaries that use the library" ON)
@@ -127,9 +126,10 @@ ENDIF()
 
 ENDIF() #MSVC
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}  ${MY_CMAKE_FLAGS} $ENV{EXTRA_CFLAGS}")
+# avoid polluting global CMAKE_C_FLAGS. We set it on a lsquic target later on.
+#set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}  ${MY_CMAKE_FLAGS} $ENV{EXTRA_CFLAGS}")
 
-MESSAGE(STATUS "Compiler flags: ${CMAKE_C_FLAGS}")
+#MESSAGE(STATUS "Compiler flags: ${CMAKE_C_FLAGS}")
 
 find_package(Perl)
 IF(NOT PERL_FOUND)
@@ -142,6 +142,7 @@ ELSE()
     SET(LIB_SUFFIX .a)
 ENDIF()
 
+#[[
 IF (NOT DEFINED BORINGSSL_INCLUDE AND DEFINED BORINGSSL_DIR)
     FIND_PATH(BORINGSSL_INCLUDE NAMES openssl/ssl.h
                 PATHS ${BORINGSSL_DIR}/include
@@ -157,18 +158,18 @@ ELSE()
     MESSAGE(FATAL_ERROR "BoringSSL headers not found")
 ENDIF()
 
-IF (NOT DEFINED BORINGSSL_LIB AND DEFINED BORINGSSL_DIR)
+IF (NOT DEFINED BORINGSSL_LIB AND DEFINED BORINGSSL_BINDIR)
     FOREACH(LIB_NAME ssl crypto decrepit)
         IF (CMAKE_SYSTEM_NAME STREQUAL Windows)
             FIND_LIBRARY(BORINGSSL_LIB_${LIB_NAME}
                 NAMES ${LIB_NAME}
-                PATHS ${BORINGSSL_DIR}/${LIB_NAME}
+                PATHS ${BORINGSSL_BINDIR}/${LIB_NAME}
 		PATH_SUFFIXES Debug Release MinSizeRel RelWithDebInfo
                 NO_DEFAULT_PATH)
         ELSE()
             FIND_LIBRARY(BORINGSSL_LIB_${LIB_NAME}
                 NAMES lib${LIB_NAME}${LIB_SUFFIX}
-                PATHS ${BORINGSSL_DIR}/${LIB_NAME}
+                PATHS ${BORINGSSL_BINDIR}/${LIB_NAME}
                 NO_DEFAULT_PATH)
         ENDIF()
         IF(BORINGSSL_LIB_${LIB_NAME})
@@ -203,6 +204,27 @@ ELSE()
     ENDFOREACH()
 
 ENDIF()
+]]
+
+
+# use boringssl in submodule
+add_subdirectory(boringssl)
+target_include_directories(ssl INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/boringssl/include>)
+target_include_directories(crypto INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/boringssl/include>)
+target_include_directories(decrepit INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}boringssl/include>)
+
+# disable unsed-result error on abi_test.cc:211
+target_compile_options(test_support_lib PRIVATE -Wno-unused-result)
+
+add_library(boringssl::ssl ALIAS ssl)
+add_library(boringssl::crypto ALIAS crypto)
+add_library(boringssl::decrepit ALIAS decrepit)
+
+set(BORINGSSL_INCLUDE ${CMAKE_CURRENT_LIST_DIR}/boringssl/include)
+set(BORINGSSL_LIB_ssl boringssl::ssl)
+set(BORINGSSL_LIB_crypto boringssl::crypto)
+set(BORINGSSL_LIB_decrepit boringssl::decrepit)
+
 
 SET(CMAKE_INCLUDE_CURRENT_DIR ON)
 INCLUDE_DIRECTORIES(include)
@@ -329,7 +351,11 @@ TARGET_LINK_LIBRARIES(duck_client ${LIBS})
 add_subdirectory(bin)
 ENDIF() # LSQUIC_BIN
 
+# not to pollute global CMAKE_C_FLAGS
+string(REPLACE " " ";" MY_CMAKE_FLAGS_ARR ${MY_CMAKE_FLAGS} )
+
 add_subdirectory(src)
+target_compile_options(lsquic PRIVATE ${MY_CMAKE_FLAGS_ARR})
 
 IF(LSQUIC_TESTS AND CMAKE_BUILD_TYPE STREQUAL "Debug")
     # Our test framework relies on assertions, only compile if assertions are
@@ -351,9 +377,68 @@ ELSE()
     MESSAGE(STATUS "sphinx-build not found: docs won't be made")
 ENDIF()
 
-INSTALL(FILES
-    include/lsquic.h
-    include/lsquic_types.h
-    include/lsxpack_header.h
-    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/lsquic
+#INSTALL(FILES
+#    include/lsquic.h
+#    include/lsquic_types.h
+#    include/lsxpack_header.h
+#    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/lsquic
+#)
+
+#[[
+add_library(boringssl::ssl STATIC IMPORTED)
+set_property(TARGET boringssl::ssl
+PROPERTY IMPORTED_LOCATION ${BORINGSSL_LIB_ssl}
 )
+
+add_library(boringssl::crypto STATIC IMPORTED)
+set_property(TARGET boringssl::crypto
+PROPERTY IMPORTED_LOCATION ${BORINGSSL_LIB_crypto}
+)
+]]
+
+SET_PROPERTY(TARGET lsquic PROPERTY PUBLIC_HEADER
+ include/lsquic.h
+ include/lsquic_types.h
+ include/lsxpack_header.h
+)
+
+TARGET_INCLUDE_DIRECTORIES(lsquic INTERFACE
+ $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+ $<INSTALL_INTERFACE:include/lsquic>)
+target_link_libraries(lsquic PUBLIC boringssl::ssl boringssl::crypto ${ZLIB_LIB})
+
+install(TARGETS lsquic ssl crypto decrepit
+    EXPORT lsquic-targets
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/lsquic
+ )
+
+install(EXPORT lsquic-targets
+    FILE lsquicTargets.cmake
+    NAMESPACE lsquic::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/lsquic
+)
+include(CMakePackageConfigHelpers)
+write_basic_package_version_file(
+    "lsquicConfigVersion.cmake" VERSION ${VERSION} COMPATIBILITY SameMajorVersion)
+
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/lsquicConfig.cmake.in
+@PACKAGE_INIT@\n
+include(\"\${CMAKE_CURRENT_LIST_DIR}/lsquicTargets.cmake\")
+)
+configure_package_config_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/lsquicConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/lsquicConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake
+)
+install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/lsquicConfig.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/lsquicConfigVersion.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/lsquic)
+
+#[[
+include(cmake/utils.cmake)
+print_properties(TARGET boringssl::ssl)
+print_properties(TARGET lsquic)
+]]
