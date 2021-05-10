@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 /*
  * lsquic_rechist.c -- History of received packets.
  */
@@ -496,14 +496,20 @@ lsquic_rechist_copy_ranges (struct lsquic_rechist *rechist, void *src_rechist,
 {
     const struct lsquic_packno_range *range;
     struct rechist_elem *el;
-    unsigned *next_idx;
+    unsigned prev_idx;
     int idx;
 
     /* This function only works if rechist contains no elements */
     assert(rechist->rh_n_used == 0);
 
-    next_idx = &rechist->rh_head;
-    for (range = first(src_rechist); range; range = next(src_rechist))
+    prev_idx = UINT_MAX;
+    for (range = first(src_rechist); range &&
+            /* Do not overwrite higher-numbered ranges.  (Also, logic below
+             * does not work if rechist_reuse_last_elem() is used.)
+             */
+            (rechist->rh_max_ranges == 0
+                            || rechist->rh_n_used < rechist->rh_max_ranges);
+                                                    range = next(src_rechist))
     {
         idx = rechist_alloc_elem(rechist);
         if (idx < 0)
@@ -512,8 +518,11 @@ lsquic_rechist_copy_ranges (struct lsquic_rechist *rechist, void *src_rechist,
         el->re_low = range->low;
         el->re_count = range->high - range->low + 1;
         el->re_next = UINT_MAX;
-        *next_idx = idx;
-        next_idx = &el->re_next;
+        if (prev_idx == UINT_MAX)
+            rechist->rh_head = idx;
+        else
+            rechist->rh_elems[prev_idx].re_next = idx;
+        prev_idx = idx;
     }
 
     return 0;

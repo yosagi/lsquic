@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 /*
  * lsquic_mini_conn_ietf.h -- Mini connection used by the IETF QUIC
  */
@@ -105,7 +105,6 @@ struct ietf_mini_conn
     uint8_t                         imc_ecn_packnos;
     uint8_t                         imc_ack_exp;
     uint8_t                         imc_ecn_counts_in[IMICO_N_PNS][4];
-    uint8_t                         imc_ecn_counts_out[IMICO_N_PNS][4];
     uint8_t                         imc_incoming_ecn;
     uint8_t                         imc_tls_alert;
 #define IMICO_MAX_DELAYED_PACKETS_UNVALIDATED 1u

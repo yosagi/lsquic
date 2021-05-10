@@ -1,6 +1,7 @@
-[![Build Status](https://travis-ci.com/litespeedtech/lsquic.svg?branch=master)](https://travis-ci.com/litespeedtech/lsquic)
-[![Build Status](https://api.cirrus-ci.com/github/litespeedtech/lsquic.svg)](https://cirrus-ci.com/github/litespeedtech/lsquic)
-[![Build status](https://ci.appveyor.com/api/projects/status/ij4n3vy343pkgm1j?svg=true)](https://ci.appveyor.com/project/litespeedtech/lsquic)
+[![Linux and MacOS build status](https://ci.appveyor.com/api/projects/status/x790ve5msewmva2b/branch/master?svg=true)](https://ci.appveyor.com/project/litespeedtech/lsquic-linux/branch/master)
+[![Windows build status](https://ci.appveyor.com/api/projects/status/ij4n3vy343pkgm1j/branch/master?svg=true)](https://ci.appveyor.com/project/litespeedtech/lsquic-windows/branch/master)
+[![FreeBSD build status](https://api.cirrus-ci.com/github/litespeedtech/lsquic.svg)](https://cirrus-ci.com/github/litespeedtech/lsquic)
+[![Documentation Status](https://readthedocs.org/projects/lsquic/badge/?version=latest)](https://lsquic.readthedocs.io/en/latest/?badge=latest)
 
 LiteSpeed QUIC (LSQUIC) Library README
 =============================================
@@ -13,8 +14,9 @@ and HTTP/3 functionality for servers and clients.  Most of the code in this
 distribution is used in our own products: LiteSpeed Web Server, LiteSpeed ADC,
 and OpenLiteSpeed.
 
-Currently supported QUIC versions are Q043, Q046, Q050, ID-27, ID-28, ID-29,
-and ID-32.  Support for newer versions is added soon after they are released.
+Currently supported QUIC versions are v1 (disabled by default until the
+QUIC RFC is released); Internet-Draft versions 34, 29, and 27;
+and the older "Google" QUIC versions Q043, Q046, an Q050.
 
 Documentation
 -------------
@@ -48,7 +50,7 @@ You may need to install pre-requisites like zlib and libevent.
 2. Use specific BoringSSL version
 
 ```
-git checkout b117a3a0b7bd11fe6ebd503ec6b45d6b910b41a1
+git checkout a2278d4d2cabe73f6663e3299ea7808edfa306b9
 ```
 
 3. Compile the library
@@ -165,4 +167,4 @@ Have fun,
 
 LiteSpeed QUIC Team.
 
-Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc
+Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc

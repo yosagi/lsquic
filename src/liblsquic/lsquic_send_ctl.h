@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 #ifndef LSQUIC_SEND_CTL_H
 #define LSQUIC_SEND_CTL_H 1
 
@@ -154,6 +154,10 @@ lsquic_send_ctl_init (lsquic_send_ctl_t *, struct lsquic_alarmset *,
 
 int
 lsquic_send_ctl_sent_packet (lsquic_send_ctl_t *, struct lsquic_packet_out *);
+
+void
+lsquic_send_ctl_mtu_not_sent (struct lsquic_send_ctl *ctl,
+                                                    struct lsquic_packet_out *);
 
 int
 lsquic_send_ctl_got_ack (lsquic_send_ctl_t *, const struct ack_info *,
@@ -387,7 +391,7 @@ lsquic_send_ctl_repath (struct lsquic_send_ctl *ctl,
     int keep_path_properties);
 
 void
-lsquic_send_ctl_cancel_chals (struct lsquic_send_ctl *,
+lsquic_send_ctl_cancel_path_verification (struct lsquic_send_ctl *,
                                                 const struct network_path *);
 
 void

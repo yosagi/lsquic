@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 #include <assert.h>
 #include <inttypes.h>
 #include <string.h>
@@ -239,10 +239,13 @@ lsquic_generate_cid (lsquic_cid_t *cid, size_t len)
 
 
 void
-lsquic_generate_scid (struct lsquic_conn *lconn, lsquic_cid_t *scid,
+lsquic_generate_scid (void *ctx, struct lsquic_conn *lconn, lsquic_cid_t *scid,
                                                                 unsigned len)
 {
-    lsquic_generate_cid(scid, len);
+    if (len)
+        lsquic_generate_cid(scid, len);
+    else
+        scid->len = len;
 }
 
 
@@ -324,3 +327,13 @@ lsquic_conn_stats_diff (const struct conn_stats *cumulative_stats,
 
 
 #endif
+
+
+const char *
+lsquic_conn_get_sni (struct lsquic_conn *lconn)
+{
+    if (lconn->cn_esf_c && lconn->cn_esf_c->esf_get_sni)
+        return lconn->cn_esf_c->esf_get_sni(lconn->cn_enc_session);
+    else
+        return NULL;
+}

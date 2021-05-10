@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 /*
  * lsquic_hq.h -- HTTP/3 (originally "HTTP over QUIC" or HQ) types
  */
@@ -78,6 +78,7 @@ enum http_error_code
     HEC_REQUEST_REJECTED        =  0x10B,
     HEC_REQUEST_CANCELLED       =  0x10C,
     HEC_REQUEST_INCOMPLETE      =  0x10D,
+    HEC_MESSAGE_ERROR           =  0x10E,
     HEC_CONNECT_ERROR           =  0x10F,
     HEC_VERSION_FALLBACK        =  0x110,
     HEC_QPACK_DECOMPRESSION_FAILED  = 0x200,

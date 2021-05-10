@@ -10,7 +10,7 @@ All declarations are in :file:`lsquic.h`, so it is enough to
 
 ::
 
-    #incluide <lsquic.h>
+    #include <lsquic.h>
 
 in each source file.
 
@@ -50,17 +50,18 @@ developed by the IETF.  Both types are included in a single enum:
 
         IETF QUIC version ID (Internet-Draft) 27; this version is deprecated.
 
-    .. member:: LSQVER_ID28
-
-        IETF QUIC version ID 28; this version is deprecated.
-
     .. member:: LSQVER_ID29
 
         IETF QUIC version ID 29
 
-    .. member:: LSQVER_ID32
+    .. member:: LSQVER_ID34
 
-        IETF QUIC version ID 32
+        IETF QUIC version ID 34
+
+    .. member:: LSQVER_I001
+
+        IETF QUIC version 1.  (This version is disabled by default until
+        the QUIC RFC is released).
 
     .. member:: N_LSQVER
 
@@ -866,6 +867,22 @@ settings structure:
 
        Default value is :macro:`LSQUIC_DF_DELAY_ONCLOSE`
 
+    .. member:: int             es_max_batch_size
+
+       If set to a non-zero value, specifies maximum batch size.  (The
+       batch of packets passed to :member:`lsquic_engine_api.ea_packets_out`).
+       Must be no larger than 1024.
+
+       Default value is :macro:`LSQUIC_DF_MAX_BATCH_SIZE`
+
+    .. member:: int             es_check_tp_sanity
+
+       When true, sanity checks are performed on peer's transport parameter
+       values.  If some limits are set suspiciously low, the connection won't
+       be established.
+
+       Default value is :macro:`LSQUIC_DF_CHECK_TP_SANITY`
+
 To initialize the settings structure to library defaults, use the following
 convenience function:
 
@@ -1102,6 +1119,15 @@ out of date.  Please check your :file:`lsquic.h` for actual values.*
 
     By default, calling :member:`lsquic_stream_if.on_close()` is not delayed.
 
+.. macro:: LSQUIC_DF_MAX_BATCH_SIZE
+
+    By default, maximum batch size is not specified, leaving it up to the
+    library.
+
+.. macro:: LSQUIC_DF_CHECK_TP_SANITY
+
+    Transport parameter sanity checks are performed by default.
+
 Receiving Packets
 -----------------
 
@@ -1324,6 +1350,11 @@ the engine to communicate with the user code:
         This callback lets client record information needed to
         perform session resumption next time around.
 
+        For IETF QUIC, this is called only if :member:`lsquic_engine_api.ea_get_ssl_ctx_st`
+        is *not* set, in which case the library creates its own SSL_CTX.
+
+        Note: this callback will be deprecated when gQUIC support is removed.
+
         This callback is optional.
 
     .. member:: ssize_t (*on_dg_write)(lsquic_conn_t *c, void *buf, size_t buf_sz)
@@ -1425,6 +1456,12 @@ Closing Connections
 
     This closes the connection.  :member:`lsquic_stream_if.on_conn_closed`
     and :member:`lsquic_stream_if.on_close` callbacks will be called.
+
+.. function:: void lsquic_conn_abort (lsquic_conn_t *conn)
+
+    This aborts the connection.  The connection and all associated objects
+    will be destroyed (with necessary callbacks called) during the next time
+    :func:`lsquic_engine_process_conns()` is invoked.
 
 Creating Streams
 ----------------
@@ -1944,6 +1981,10 @@ Miscellaneous Connection Functions
 .. function:: void * lsquic_conn_get_peer_ctx (lsquic_conn_t *conn, const struct sockaddr *local_sa)
 
     Get peer context associated with the connection and local address.
+
+.. function:: const char * lsquic_conn_get_sni (lsquic_conn_t *conn)
+
+    Get SNI sent by the client.
 
 .. function:: enum LSQUIC_CONN_STATUS lsquic_conn_status (lsquic_conn_t *conn, char *errbuf, size_t bufsz)
 

@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 /*
  * lsquic_mini_conn_ietf.c -- Mini connection used by the IETF QUIC
  */
@@ -52,6 +52,9 @@ static unsigned highest_bit_set (unsigned long long);
 static int
 imico_can_send (const struct ietf_mini_conn *, size_t);
 
+static void
+ietf_mini_conn_ci_abort_error (struct lsquic_conn *lconn, int is_app,
+                                unsigned error_code, const char *fmt, ...);
 
 static const enum header_type el2hety[] =
 {
@@ -500,7 +503,7 @@ lsquic_mini_conn_ietf_new (struct lsquic_engine_public *enpub,
     /* Generate new SCID. Since is not the original SCID, it is given
      * a sequence number (0) and therefore can be retired by the client.
      */
-    enpub->enp_generate_scid(&conn->imc_conn,
+    enpub->enp_generate_scid(enpub->enp_gen_scid_ctx, &conn->imc_conn,
         &conn->imc_conn.cn_cces[1].cce_cid, enpub->enp_settings.es_scid_len);
 
     LSQ_DEBUGC("generated SCID %"CID_FMT" at index %u, switching to it",
@@ -1378,15 +1381,10 @@ imico_switch_to_trechist (struct ietf_mini_conn *conn)
         if (conn->imc_recvd_packnos.bitmasks[pns])
         {
             lsquic_imico_rechist_init(&iter, conn, pns);
-            if (0 != lsquic_trechist_copy_ranges(&masks[pns],
+            lsquic_trechist_copy_ranges(&masks[pns],
                                 elems + TRECHIST_MAX_RANGES * pns, &iter,
                                 lsquic_imico_rechist_first,
-                                lsquic_imico_rechist_next))
-            {
-                LSQ_WARN("cannot copy ranges from bitmask to trechist");
-                free(elems);
-                return -1;
-            }
+                                lsquic_imico_rechist_next);
         }
         else
             masks[pns] = 0;
@@ -1437,11 +1435,19 @@ ietf_mini_conn_ci_packet_in (struct lsquic_conn *lconn,
 
     dec_packin = lconn->cn_esf_c->esf_decrypt_packet(lconn->cn_enc_session,
                                 conn->imc_enpub, &conn->imc_conn, packet_in);
-    if (dec_packin != DECPI_OK)
+    switch (dec_packin)
     {
+    case DECPI_OK:
+        break;
+    case DECPI_VIOLATION:
+        ietf_mini_conn_ci_abort_error(lconn, 0, TEC_PROTOCOL_VIOLATION,
+                    "protocol violation detected while decrypting packet");
+        return;
+    case DECPI_NOT_YET:
+        imico_maybe_delay_processing(conn, packet_in);
+        return;
+    default:
         LSQ_DEBUG("could not decrypt packet");
-        if (DECPI_NOT_YET == dec_packin)
-            imico_maybe_delay_processing(conn, packet_in);
         return;
     }
 
@@ -1516,8 +1522,6 @@ ietf_mini_conn_ci_packet_sent (struct lsquic_conn *lconn,
         mc->mc_flags &= ~MC_UNSENT_ACK;
     }
 #endif
-    ++conn->imc_ecn_counts_out[ lsquic_packet_out_pns(packet_out) ]
-                              [ lsquic_packet_out_ecn(packet_out) ];
     if (packet_out->po_header_type == HETY_HANDSHAKE)
         conn->imc_flags |= IMC_HSK_PACKET_SENT;
     LSQ_DEBUG("%s: packet %"PRIu64" sent", __func__, packet_out->po_packno);

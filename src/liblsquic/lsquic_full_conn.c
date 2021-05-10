@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 /*
  * lsquic_full_conn.c -- A "full" connection object has full functionality
  */
@@ -83,6 +83,9 @@ enum stream_if { STREAM_IF_STD, STREAM_IF_HSK, STREAM_IF_HDR, N_STREAM_IFS };
 
 /* Maximum number of ACK ranges that can fit into gQUIC ACK frame */
 #define MAX_ACK_RANGES 256
+
+/* HANDSHAKE and HEADERS streams are always open in gQUIC connection */
+#define N_SPECIAL_STREAMS 2
 
 /* IMPORTANT: Keep values of FC_SERVER and FC_HTTP same as LSENG_SERVER
  * and LSENG_HTTP.
@@ -333,6 +336,7 @@ recent_packet_hist_new (struct full_conn *conn, unsigned out,
     conn->fc_recent_packets[out].els[idx].time = time;
 }
 
+
 static void
 recent_packet_hist_frames (struct full_conn *conn, unsigned out,
                                                 enum quic_ft_bit frame_types)
@@ -341,6 +345,8 @@ recent_packet_hist_frames (struct full_conn *conn, unsigned out,
     idx = (conn->fc_recent_packets[out].idx - 1) % KEEP_PACKET_HISTORY;
     conn->fc_recent_packets[out].els[idx].frame_types |= frame_types;
 }
+
+
 #else
 #define recent_packet_hist_new(conn, out, time)
 #define recent_packet_hist_frames(conn, out, frames)
@@ -539,6 +545,7 @@ apply_peer_settings (struct full_conn *conn)
     lsquic_full_conn_on_peer_config(conn, cfcw, sfcw, mids);
     return 0;
 }
+
 
 static const struct conn_iface *full_conn_iface_ptr;
 
@@ -1245,6 +1252,8 @@ verify_ack_frame (struct full_conn *conn, const unsigned char *buf, int bufsz)
     assert(i == ack_info->n_ranges);
     LSQ_DEBUG("Sent ACK frame %s", ack_buf);
 }
+
+
 #endif
 
 
@@ -1828,7 +1837,7 @@ reset_local_streams_over_goaway (struct full_conn *conn)
                                  el = lsquic_hash_next(conn->fc_pub.all_streams))
     {
         stream = lsquic_hashelem_getdata(el);
-        if (stream->id > conn->fc_goaway_stream_id &&
+        if ((int64_t) stream->id > (int64_t) conn->fc_goaway_stream_id &&
             ((stream->id & 1) ^ is_server /* Locally initiated? */))
         {
             lsquic_stream_received_goaway(stream);
@@ -2083,8 +2092,6 @@ static unsigned
 process_connection_close_frame (struct full_conn *conn, lsquic_packet_in_t *packet_in,
                                 const unsigned char *p, size_t len)
 {
-    lsquic_stream_t *stream;
-    struct lsquic_hash_elem *el;
     uint64_t error_code;
     uint16_t reason_len;
     uint8_t reason_off;
@@ -2101,17 +2108,7 @@ process_connection_close_frame (struct full_conn *conn, lsquic_packet_in_t *pack
     if (conn->fc_stream_ifs[STREAM_IF_STD].stream_if->on_conncloseframe_received)
         conn->fc_stream_ifs[STREAM_IF_STD].stream_if->on_conncloseframe_received(
             &conn->fc_conn, -1, error_code, (const char *) p + reason_off, reason_len);
-    conn->fc_flags |= FC_RECV_CLOSE;
-    if (!(conn->fc_flags & FC_CLOSING))
-    {
-        for (el = lsquic_hash_first(conn->fc_pub.all_streams); el;
-                                     el = lsquic_hash_next(conn->fc_pub.all_streams))
-        {
-            stream = lsquic_hashelem_getdata(el);
-            lsquic_stream_shutdown_internal(stream);
-        }
-        conn->fc_flags |= FC_CLOSING;
-    }
+    conn->fc_flags |= FC_RECV_CLOSE|FC_CLOSING;
     return parsed_len;
 }
 
@@ -2286,6 +2283,7 @@ process_ver_neg_packet (struct full_conn *conn, lsquic_packet_in_t *packet_in)
     versions &= conn->fc_ver_neg.vn_supp;
     if (0 == versions)
     {
+        conn->fc_flags |= FC_HSK_FAILED;
         ABORT_ERROR("client does not support any of the server-specified "
                     "versions");
         return;
@@ -2411,7 +2409,7 @@ process_regular_packet (struct full_conn *conn, lsquic_packet_in_t *packet_in)
         {
             frame_types = packet_in->pi_frame_types;
             if ((conn->fc_flags & FC_GOING_AWAY)
-                && lsquic_hash_count(conn->fc_pub.all_streams) < 3)
+                && lsquic_hash_count(conn->fc_pub.all_streams) <= N_SPECIAL_STREAMS)
             {
                 /* Ignore PING frames if we are going away and there are no
                  * active streams.  (HANDSHAKE and HEADERS streams are the
@@ -2624,10 +2622,12 @@ maybe_close_conn (struct full_conn *conn)
     struct lsquic_stream *stream;
     struct lsquic_hash_elem *el;
 #endif
+    const unsigned n_special_streams = N_SPECIAL_STREAMS
+                                     - !(conn->fc_flags & FC_HTTP);
 
     if ((conn->fc_flags & (FC_CLOSING|FC_GOAWAY_SENT|FC_SERVER))
                                             == (FC_GOAWAY_SENT|FC_SERVER)
-        && lsquic_hash_count(conn->fc_pub.all_streams) == 2)
+        && lsquic_hash_count(conn->fc_pub.all_streams) == n_special_streams)
     {
 #ifndef NDEBUG
         for (el = lsquic_hash_first(conn->fc_pub.all_streams); el;
@@ -3193,7 +3193,7 @@ conn_ok_to_close (const struct full_conn *conn)
         || (conn->fc_flags & FC_RECV_CLOSE)
         || (
                !lsquic_send_ctl_have_outgoing_stream_frames(&conn->fc_send_ctl)
-            && lsquic_hash_count(conn->fc_pub.all_streams) == 0
+            && lsquic_hash_count(conn->fc_pub.all_streams) <= N_SPECIAL_STREAMS
             && lsquic_send_ctl_have_unacked_stream_frames(&conn->fc_send_ctl) == 0);
 }
 
@@ -3768,6 +3768,7 @@ full_conn_ci_abort (struct lsquic_conn *lconn)
     struct full_conn *conn = (struct full_conn *) lconn;
     LSQ_INFO("User aborted connection");
     conn->fc_flags |= FC_ABORTED;
+    lsquic_engine_add_conn_to_tickable(conn->fc_enpub, lconn);
 }
 
 
@@ -3806,7 +3807,8 @@ full_conn_ci_close (struct lsquic_conn *lconn)
                                      el = lsquic_hash_next(conn->fc_pub.all_streams))
         {
             stream = lsquic_hashelem_getdata(el);
-            lsquic_stream_shutdown_internal(stream);
+            if (!lsquic_stream_is_critical(stream))
+                lsquic_stream_maybe_reset(stream, 0, 1);
         }
         conn->fc_flags |= FC_CLOSING;
         if (!(conn->fc_flags & FC_GOAWAY_SENT))
@@ -3932,7 +3934,7 @@ headers_stream_on_stream_error (void *ctx, lsquic_stream_id_t stream_id)
          * errors.  There does not seem to be a good reason to figure out
          * and send more specific error codes.
          */
-        lsquic_stream_reset_ext(stream, 1, 0);
+        lsquic_stream_maybe_reset(stream, 1, 0);
     }
 }
 
@@ -4064,7 +4066,6 @@ headers_stream_on_priority (void *ctx, lsquic_stream_id_t stream_id,
 }
 
 
-
 #define STRLEN(s) (sizeof(s) - 1)
 
 static struct uncompressed_headers *
@@ -4087,6 +4088,7 @@ synthesize_push_request (struct full_conn *conn, void *hset,
     if (lsquic_http1x_if == conn->fc_enpub->enp_hsi_if)
         uh->uh_flags    |= UH_H1H;
     uh->uh_hset          = hset;
+    uh->uh_next          = NULL;
 
     return uh;
 }
@@ -4230,7 +4232,12 @@ full_conn_ci_status (struct lsquic_conn *lconn, char *errbuf, size_t bufsz)
     }
 
     if (conn->fc_flags & FC_ERROR)
-        return LSCONN_ST_ERROR;
+    {
+        if (conn->fc_flags & FC_HSK_FAILED)
+            return LSCONN_ST_VERNEG_FAILURE;
+        else
+            return LSCONN_ST_ERROR;
+    }
     if (conn->fc_flags & FC_TIMED_OUT)
         return LSCONN_ST_TIMED_OUT;
     if (conn->fc_flags & FC_ABORTED)
@@ -4263,7 +4270,7 @@ full_conn_ci_is_tickable (lsquic_conn_t *lconn)
             !lsquic_send_ctl_sched_is_blocked(&conn->fc_send_ctl)))
     {
         const enum full_conn_flags send_flags = FC_SEND_GOAWAY
-                |FC_SEND_STOP_WAITING|FC_SEND_PING|FC_SEND_WUF|FC_CLOSING;
+                |FC_SEND_STOP_WAITING|FC_SEND_PING|FC_SEND_WUF;
         if (conn->fc_flags & send_flags)
         {
             LSQ_DEBUG("tickable: flags: 0x%X", conn->fc_flags & send_flags);
@@ -4322,6 +4329,13 @@ full_conn_ci_is_tickable (lsquic_conn_t *lconn)
                 stream->id);
             return 1;
         }
+
+    if (conn->fc_flags & FC_IMMEDIATE_CLOSE_FLAGS)
+    {
+        LSQ_DEBUG("tickable: immediate close flags: 0x%X",
+            (unsigned) (conn->fc_flags & FC_IMMEDIATE_CLOSE_FLAGS));
+        return 1;
+    }
 
     LSQ_DEBUG("not tickable");
     return 0;
@@ -4454,6 +4468,7 @@ full_conn_ci_get_stats (struct lsquic_conn *lconn)
     return &conn->fc_stats;
 }
 
+
 #include "lsquic_cong_ctl.h"
 
 static void
@@ -4491,6 +4506,8 @@ full_conn_ci_log_stats (struct lsquic_conn *lconn)
     *conn->fc_last_stats = conn->fc_stats;
     memset(bs, 0, sizeof(*bs));
 }
+
+
 #endif
 
 

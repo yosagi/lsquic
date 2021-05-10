@@ -1,4 +1,4 @@
-# Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE.
+# Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE.
 SET(lsquic_STAT_SRCS
     ls-qpack/lsqpack.c
     lsquic_adaptive_cc.c
@@ -85,7 +85,13 @@ SET(lsquic_STAT_SRCS
 )
 
 IF(NOT MSVC)
-set_source_files_properties(ls-qpack/lsqpack.c PROPERTIES COMPILE_FLAGS -Wno-uninitialized)
+    SET(QPACK_FLAGS "-Wno-uninitialized")
+    INCLUDE(CheckCCompilerFlag)
+    CHECK_C_COMPILER_FLAG(-Wno-implicit-fallthrough HAS_NO_IMPLICIT_FALLTHROUGH)
+    IF (HAS_NO_IMPLICIT_FALLTHROUGH)
+        SET(QPACK_FLAGS "${QPACK_FLAGS} -Wno-implicit-fallthrough")
+    ENDIF()
+set_source_files_properties(ls-qpack/lsqpack.c PROPERTIES COMPILE_FLAGS ${QPACK_FLAGS})
 ENDIF()
 
 include_directories(ls-qpack)

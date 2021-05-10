@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 /*
  * lsquic_stream.c -- stream processing
  */
@@ -143,6 +143,9 @@ stream_readable_http_ietf (struct lsquic_stream *stream);
 
 static ssize_t
 stream_write_buf (struct lsquic_stream *stream, const void *buf, size_t sz);
+
+static void
+stream_reset (struct lsquic_stream *, uint64_t error_code, int do_close);
 
 static size_t
 active_hq_frame_sizes (const struct lsquic_stream *);
@@ -620,15 +623,13 @@ lsquic_stream_drop_hset_ref (struct lsquic_stream *stream)
 
 
 static void
-destroy_uh (struct lsquic_stream *stream)
+destroy_uh (struct uncompressed_headers *uh, const struct lsquic_hset_if *hsi_if)
 {
-    if (stream->uh)
+    if (uh)
     {
-        if (stream->uh->uh_hset)
-            stream->conn_pub->enpub->enp_hsi_if
-                            ->hsi_discard_header_set(stream->uh->uh_hset);
-        free(stream->uh);
-        stream->uh = NULL;
+        if (uh->uh_hset)
+            hsi_if->hsi_discard_header_set(uh->uh_hset);
+        free(uh);
     }
 }
 
@@ -638,6 +639,7 @@ lsquic_stream_destroy (lsquic_stream_t *stream)
 {
     struct push_promise *promise;
     struct stream_hq_frame *shf;
+    struct uncompressed_headers *uh;
 
     stream->stream_flags |= STREAM_U_WRITE_DONE|STREAM_U_READ_DONE;
     if ((stream->stream_flags & (STREAM_ONNEW_DONE|STREAM_ONCLOSE_DONE)) ==
@@ -684,7 +686,12 @@ lsquic_stream_destroy (lsquic_stream_t *stream)
     }
     while ((shf = STAILQ_FIRST(&stream->sm_hq_frames)))
         stream_hq_frame_put(stream, shf);
-    destroy_uh(stream);
+    while(stream->uh)
+    {
+        uh = stream->uh;
+        stream->uh = uh->uh_next;
+        destroy_uh(uh, stream->conn_pub->enpub->enp_hsi_if);
+    }
     free(stream->sm_buf);
     free(stream->sm_header_block);
     LSQ_DEBUG("destroyed stream");
@@ -909,11 +916,11 @@ lsquic_stream_readable (struct lsquic_stream *stream)
 int
 lsquic_stream_is_write_reset (const struct lsquic_stream *stream)
 {
-    if (stream->sm_bflags & SMBF_IETF)
-        return stream->stream_flags & STREAM_SS_RECVD;
-    else
-        return (stream->stream_flags & (STREAM_RST_RECVD|STREAM_RST_SENT))
-            || (stream->sm_qflags & SMQF_SEND_RST);
+    /* The two protocols use different frames to effect write reset: */
+    const enum stream_flags cause_flag = stream->sm_bflags & SMBF_IETF
+        ? STREAM_SS_RECVD : STREAM_RST_RECVD;
+    return (stream->stream_flags & (cause_flag|STREAM_RST_SENT))
+        || (stream->sm_qflags & SMQF_SEND_RST);
 }
 
 
@@ -1284,7 +1291,7 @@ lsquic_stream_rst_in (lsquic_stream_t *stream, uint64_t offset,
                         (STREAM_RST_SENT|STREAM_SS_SENT|STREAM_FIN_SENT))
                             && !(stream->sm_bflags & SMBF_IETF)
                                     && !(stream->sm_qflags & SMQF_SEND_RST))
-        lsquic_stream_reset_ext(stream, 7 /* QUIC_RST_ACKNOWLEDGEMENT */, 0);
+        stream_reset(stream, 7 /* QUIC_RST_ACKNOWLEDGEMENT */, 0);
 
     stream->stream_flags |= STREAM_RST_RECVD;
 
@@ -1324,7 +1331,7 @@ lsquic_stream_stop_sending_in (struct lsquic_stream *stream,
 
     if (!(stream->stream_flags & (STREAM_RST_SENT|STREAM_FIN_SENT))
                                     && !(stream->sm_qflags & SMQF_SEND_RST))
-        lsquic_stream_reset_ext(stream, 0, 0);
+        stream_reset(stream, 0, 0);
 
     maybe_finish_stream(stream);
     maybe_schedule_call_on_close(stream);
@@ -1440,7 +1447,8 @@ static size_t
 read_uh (struct lsquic_stream *stream,
         size_t (*readf)(void *, const unsigned char *, size_t, int), void *ctx)
 {
-    struct http1x_headers *const h1h = stream->uh->uh_hset;
+    struct uncompressed_headers *uh = stream->uh;
+    struct http1x_headers *const h1h = uh->uh_hset;
     size_t nread;
 
     nread = readf(ctx, (unsigned char *) h1h->h1h_buf + h1h->h1h_off,
@@ -1449,8 +1457,10 @@ read_uh (struct lsquic_stream *stream,
     h1h->h1h_off += nread;
     if (h1h->h1h_off == h1h->h1h_size)
     {
-        LSQ_DEBUG("read all uncompressed headers");
-        destroy_uh(stream);
+        stream->uh = uh->uh_next;
+        LSQ_DEBUG("read all uncompressed headers from uh: %p, next uh: %p",
+                    uh, stream->uh);
+        destroy_uh(uh, stream->conn_pub->enpub->enp_hsi_if);
         if (stream->stream_flags & STREAM_HEAD_IN_FIN)
         {
             stream->stream_flags |= STREAM_FIN_REACHED;
@@ -1473,7 +1483,7 @@ verify_cl_on_fin (struct lsquic_stream *stream)
     if (stream->sm_data_in != 0 && stream->sm_cont_len != stream->sm_data_in)
     {
         lconn = stream->conn_pub->lconn;
-        lconn->cn_if->ci_abort_error(lconn, 1, HEC_GENERAL_PROTOCOL_ERROR,
+        lconn->cn_if->ci_abort_error(lconn, 1, HEC_MESSAGE_ERROR,
             "number of bytes in DATA frames of stream %"PRIu64" is %llu, "
             "while content-length specified of %llu", stream->id,
             stream->sm_data_in, stream->sm_cont_len);
@@ -1767,7 +1777,7 @@ handle_early_read_shutdown_gquic (struct lsquic_stream *stream)
 {
     if (!(stream->stream_flags & STREAM_RST_SENT))
     {
-        lsquic_stream_reset_ext(stream, 7 /* QUIC_STREAM_CANCELLED */, 0);
+        stream_reset(stream, 7 /* QUIC_STREAM_CANCELLED */, 0);
         stream->sm_qflags |= SMQF_WAIT_FIN_OFF;
     }
 }
@@ -1837,7 +1847,8 @@ stream_shutdown_write (lsquic_stream_t *stream)
      * the flags indicate that nothing else should be written.
      */
     if (!(stream->sm_bflags & SMBF_CRYPTO)
-            && !(stream->stream_flags & (STREAM_FIN_SENT|STREAM_RST_SENT))
+            && !((stream->stream_flags & (STREAM_FIN_SENT|STREAM_RST_SENT))
+                    || (stream->sm_qflags & SMQF_SEND_RST))
                 && !stream_is_incoming_unidir(stream)
                         /* In gQUIC, receiving a RESET means "stop sending" */
                     && !(!(stream->sm_bflags & SMBF_IETF)
@@ -1847,7 +1858,7 @@ stream_shutdown_write (lsquic_stream_t *stream)
                 && !(stream->stream_flags & STREAM_HEADERS_SENT))
         {
             LSQ_DEBUG("headers not sent, send a reset");
-            lsquic_stream_reset(stream, 0);
+            stream_reset(stream, 0, 1);
         }
         else if (stream->sm_n_buffered == 0)
         {
@@ -2362,12 +2373,13 @@ maybe_mark_as_blocked (lsquic_stream_t *stream)
 void
 lsquic_stream_dispatch_read_events (lsquic_stream_t *stream)
 {
-    assert(stream->sm_qflags & SMQF_WANT_READ);
-
-    if (stream->sm_bflags & SMBF_RW_ONCE)
-        stream_dispatch_read_events_once(stream);
-    else
-        stream_dispatch_read_events_loop(stream);
+    if (stream->sm_qflags & SMQF_WANT_READ)
+    {
+        if (stream->sm_bflags & SMBF_RW_ONCE)
+            stream_dispatch_read_events_once(stream);
+        else
+            stream_dispatch_read_events_loop(stream);
+    }
 }
 
 
@@ -2380,7 +2392,9 @@ lsquic_stream_dispatch_write_events (lsquic_stream_t *stream)
     unsigned short n_buffered;
     enum stream_q_flags q_flags;
 
-    assert(stream->sm_qflags & SMQF_WRITE_Q_FLAGS);
+    if (!(stream->sm_qflags & SMQF_WRITE_Q_FLAGS))
+        return;
+
     q_flags = stream->sm_qflags & SMQF_WRITE_Q_FLAGS;
     tosend_off = stream->tosend_off;
     n_buffered = stream->sm_n_buffered;
@@ -2662,8 +2676,8 @@ static void
 stream_hq_frame_put (struct lsquic_stream *stream,
                                                 struct stream_hq_frame *shf)
 {
-    assert(STAILQ_FIRST(&stream->sm_hq_frames) == shf);
-    STAILQ_REMOVE_HEAD(&stream->sm_hq_frames, shf_next);
+    /* In vast majority of cases, the frame to put is at the head: */
+    STAILQ_REMOVE(&stream->sm_hq_frames, shf, stream_hq_frame, shf_next);
     if (frame_in_stream(stream, shf))
         memset(shf, 0, sizeof(*shf));
     else
@@ -2952,7 +2966,8 @@ frame_hq_gen_read (void *ctx, void *begin_buf, size_t len, int *fin)
                 }
                 else
                 {
-                    /* TODO: abort connection?  Handle failure somehow */
+                    stream->conn_pub->lconn->cn_if->ci_internal_error(
+                        stream->conn_pub->lconn, "cannot activate HQ frame");
                     break;
                 }
             }
@@ -3464,21 +3479,30 @@ stream_write_to_packets (lsquic_stream_t *stream, struct lsquic_reader *reader,
 }
 
 
-/* Perform an implicit flush when we hit connection limit while buffering
- * data.  This is to prevent a (theoretical) stall:
+/* Perform an implicit flush when we hit connection or stream flow control
+ * limit while buffering data.
+ *
+ * This is to prevent a (theoretical) stall.  Scenario 1:
  *
  * Imagine a number of streams, all of which buffered some data.  The buffered
  * data is up to connection cap, which means no further writes are possible.
  * None of them flushes, which means that data is not sent and connection
  * WINDOW_UPDATE frame never arrives from peer.  Stall.
+ *
+ * Scenario 2:
+ *
+ * Stream flow control window is smaller than the packetizing threshold.  In
+ * this case, without a flush, the peer will never send a WINDOW_UPDATE.  Stall.
  */
 static int
 maybe_flush_stream (struct lsquic_stream *stream)
 {
-    if (stream->sm_n_buffered > 0
-          && (stream->sm_bflags & SMBF_CONN_LIMITED)
-            && lsquic_conn_cap_avail(&stream->conn_pub->conn_cap) == 0)
+    if (stream->sm_n_buffered > 0 && stream->sm_write_avail(stream) == 0)
+    {
+        LSQ_DEBUG("out of flow control credits, flush %zu buffered bytes",
+            stream->sm_n_buffered + active_hq_frame_sizes(stream));
         return stream_flush_nocheck(stream);
+    }
     else
         return 0;
 }
@@ -4028,7 +4052,12 @@ send_headers_ietf (struct lsquic_stream *stream,
         return -1;
 #endif
 
-    stream->stream_flags &= ~STREAM_PUSHING;
+    if (stream->stream_flags & STREAM_PUSHING)
+    {
+        LSQ_DEBUG("push promise still being written, cannot send header now");
+        errno = EBADMSG;
+        return -1;
+    }
     stream->stream_flags |= STREAM_NOPUSH;
 
     /* TODO: Optimize for the common case: write directly to sm_buf and fall
@@ -4164,7 +4193,7 @@ lsquic_stream_send_headers (lsquic_stream_t *stream,
                             const lsquic_http_headers_t *headers, int eos)
 {
     if ((stream->sm_bflags & SMBF_USE_HEADERS)
-            && !(stream->stream_flags & (STREAM_HEADERS_SENT|STREAM_U_WRITE_DONE)))
+            && !(stream->stream_flags & (STREAM_U_WRITE_DONE)))
     {
         if (stream->sm_bflags & SMBF_IETF)
             return send_headers_ietf(stream, headers, eos);
@@ -4225,15 +4254,22 @@ lsquic_stream_set_max_send_off (lsquic_stream_t *stream, uint64_t offset)
 
 
 void
-lsquic_stream_reset (lsquic_stream_t *stream, uint64_t error_code)
+lsquic_stream_maybe_reset (struct lsquic_stream *stream, uint64_t error_code,
+                           int do_close)
 {
-    lsquic_stream_reset_ext(stream, error_code, 1);
+    if (!((stream->stream_flags
+            & (STREAM_RST_SENT|STREAM_FIN_SENT|STREAM_U_WRITE_DONE))
+        || (stream->sm_qflags & SMQF_SEND_RST)))
+    {
+        stream_reset(stream, error_code, do_close);
+    }
+    else if (do_close)
+        stream_shutdown_read(stream);
 }
 
 
-void
-lsquic_stream_reset_ext (lsquic_stream_t *stream, uint64_t error_code,
-                         int do_close)
+static void
+stream_reset (struct lsquic_stream *stream, uint64_t error_code, int do_close)
 {
     if ((stream->stream_flags & STREAM_RST_SENT)
                                     || (stream->sm_qflags & SMQF_SEND_RST))
@@ -4382,15 +4418,19 @@ static int
 stream_uh_in_gquic (struct lsquic_stream *stream,
                                             struct uncompressed_headers *uh)
 {
-    if ((stream->sm_bflags & SMBF_USE_HEADERS)
-                                    && !(stream->stream_flags & STREAM_HAVE_UH))
+    struct uncompressed_headers **next;
+    if ((stream->sm_bflags & SMBF_USE_HEADERS))
     {
         SM_HISTORY_APPEND(stream, SHE_HEADERS_IN);
         LSQ_DEBUG("received uncompressed headers");
         stream->stream_flags |= STREAM_HAVE_UH;
         if (uh->uh_flags & UH_FIN)
             stream->stream_flags |= STREAM_FIN_RECVD|STREAM_HEAD_IN_FIN;
-        stream->uh = uh;
+        next = &stream->uh;
+        while(*next)
+            next = &(*next)->uh_next;
+        *next = uh;
+        assert(uh->uh_next == NULL);
         if (uh->uh_oth_stream_id == 0)
         {
             if (uh->uh_weight)
@@ -4414,9 +4454,10 @@ stream_uh_in_ietf (struct lsquic_stream *stream,
                                             struct uncompressed_headers *uh)
 {
     int push_promise;
+    struct uncompressed_headers **next;
 
     push_promise = lsquic_stream_header_is_pp(stream);
-    if (!(stream->stream_flags & STREAM_HAVE_UH) && !push_promise)
+    if (!push_promise)
     {
         SM_HISTORY_APPEND(stream, SHE_HEADERS_IN);
         LSQ_DEBUG("received uncompressed headers");
@@ -4431,7 +4472,11 @@ stream_uh_in_ietf (struct lsquic_stream *stream,
                                             && lsquic_stream_is_pushed(stream));
             stream->stream_flags |= STREAM_FIN_RECVD|STREAM_HEAD_IN_FIN;
         }
-        stream->uh = uh;
+        next = &stream->uh;
+        while(*next)
+            next = &(*next)->uh_next;
+        *next = uh;
+        assert(uh->uh_next == NULL);
         if (uh->uh_oth_stream_id == 0)
         {
             if (uh->uh_weight)
@@ -4580,7 +4625,7 @@ lsquic_stream_refuse_push (lsquic_stream_t *stream)
             && !(stream->stream_flags & STREAM_RST_SENT))
     {
         LSQ_DEBUG("refusing pushed stream: send reset");
-        lsquic_stream_reset_ext(stream, 8 /* QUIC_REFUSED_STREAM */, 1);
+        stream_reset(stream, 8 /* QUIC_REFUSED_STREAM */, 1);
         return 0;
     }
     else
@@ -4623,6 +4668,7 @@ void *
 lsquic_stream_get_hset (struct lsquic_stream *stream)
 {
     void *hset;
+    struct uncompressed_headers *uh;
 
     if (stream_is_read_reset(stream))
     {
@@ -4647,9 +4693,14 @@ lsquic_stream_get_hset (struct lsquic_stream *stream)
 
     hset = stream->uh->uh_hset;
     stream->uh->uh_hset = NULL;
-    destroy_uh(stream);
+
+    uh = stream->uh;
+    stream->uh = uh->uh_next;
+    free(uh);
+
     if (stream->stream_flags & STREAM_HEAD_IN_FIN)
     {
+
         stream->stream_flags |= STREAM_FIN_REACHED;
         SM_HISTORY_APPEND(stream, SHE_REACH_FIN);
     }
@@ -4677,31 +4728,21 @@ static int
 update_type_hist_and_check (const struct lsquic_stream *stream,
                                                     struct hq_filter *filter)
 {
-    /* 3-bit codes: */
-    enum {
-        CODE_UNSET,
-        CODE_HEADER,    /* H    Header  */
-        CODE_DATA,      /* D    Data    */
-        CODE_PLUS,      /* +    Plus: meaning previous frame repeats */
-    };
-    static const unsigned valid_seqs[] = {
-        /* Ordered by expected frequency */
-        0123,   /* HD+  */
-        012,    /* HD   */
-        01,     /* H    */
-        013,    /* H+   */ /* Really HH, but we don't record it like this */
-        01231,  /* HD+H */
-        0121,   /* HDH  */
-    };
-    unsigned code, i;
-
     switch (filter->hqfi_type)
     {
     case HQFT_HEADERS:
-        code = CODE_HEADER;
+        if (filter->hqfi_flags & HQFI_FLAG_TRAILER)
+            return -1;
+        if (filter->hqfi_flags & HQFI_FLAG_DATA)
+            filter->hqfi_flags |= HQFI_FLAG_TRAILER;
+        else
+            filter->hqfi_flags |= HQFI_FLAG_HEADER;
         break;
     case HQFT_DATA:
-        code = CODE_DATA;
+        if ((filter->hqfi_flags & (HQFI_FLAG_HEADER
+              | HQFI_FLAG_TRAILER)) != HQFI_FLAG_HEADER)
+            return -1;
+        filter->hqfi_flags |= HQFI_FLAG_DATA;
         break;
     case HQFT_PUSH_PROMISE:
         /* [draft-ietf-quic-http-24], Section 7 */
@@ -4739,31 +4780,7 @@ update_type_hist_and_check (const struct lsquic_stream *stream,
         return 0;
     }
 
-    if (filter->hqfi_hist_idx >= MAX_HQFI_ENTRIES)
-        return -1;
-
-    if (filter->hqfi_hist_idx && (filter->hqfi_hist_buf & 7) == code)
-    {
-        filter->hqfi_hist_buf <<= 3;
-        filter->hqfi_hist_buf |= CODE_PLUS;
-        filter->hqfi_hist_idx++;
-    }
-    else if (filter->hqfi_hist_idx > 1
-            && ((filter->hqfi_hist_buf >> 3) & 7) == code
-            && (filter->hqfi_hist_buf & 7) == CODE_PLUS)
-        /* Keep it at plus, do nothing */;
-    else
-    {
-        filter->hqfi_hist_buf <<= 3;
-        filter->hqfi_hist_buf |= code;
-        filter->hqfi_hist_idx++;
-    }
-
-    for (i = 0; i < sizeof(valid_seqs) / sizeof(valid_seqs[0]); ++i)
-        if (filter->hqfi_hist_buf == valid_seqs[i])
-            return 0;
-
-    return -1;
+    return 0;
 }
 
 
@@ -4792,7 +4809,7 @@ verify_cl_on_new_data_frame (struct lsquic_stream *stream,
     if (stream->sm_data_in > stream->sm_cont_len)
     {
         lconn = stream->conn_pub->lconn;
-        lconn->cn_if->ci_abort_error(lconn, 1, HEC_GENERAL_PROTOCOL_ERROR,
+        lconn->cn_if->ci_abort_error(lconn, 1, HEC_MESSAGE_ERROR,
             "number of bytes in DATA frames of stream %"PRIu64" exceeds "
             "content-length limit of %llu", stream->id, stream->sm_cont_len);
     }
@@ -4831,8 +4848,7 @@ hq_read (void *ctx, const unsigned char *buf, size_t sz, int fin)
             {
                 lconn = stream->conn_pub->lconn;
                 filter->hqfi_flags |= HQFI_FLAG_ERROR;
-                LSQ_INFO("unexpected HTTP/3 frame sequence: %o",
-                    filter->hqfi_hist_buf);
+                LSQ_INFO("unexpected HTTP/3 frame sequence");
                 lconn->cn_if->ci_abort_error(lconn, 1, HEC_FRAME_UNEXPECTED,
                     "unexpected HTTP/3 frame sequence on stream %"PRIu64,
                     stream->id);
@@ -5321,6 +5337,7 @@ on_write_pp_wrapper (struct lsquic_stream *stream, lsquic_stream_ctx_t *h)
             nw, promise->pp_write_state == PPWS_DONE ? "done" : "not done");
         if (promise->pp_write_state == PPWS_DONE)
         {
+            stream->stream_flags &= ~STREAM_PUSHING;
             /* Restore want_write flag */
             want_write = !!(stream->sm_qflags & SMQF_WANT_WRITE);
             if (want_write != stream->sm_saved_want_write)
@@ -5348,11 +5365,14 @@ lsquic_stream_push_promise (struct lsquic_stream *stream,
                                                 struct push_promise *promise)
 {
     struct lsquic_reader pp_reader;
+    struct stream_hq_frame *shf;
     unsigned bits, len;
     ssize_t nw;
 
     assert(stream->sm_bflags & SMBF_IETF);
-    assert(lsquic_stream_can_push(stream));
+
+    if (stream->stream_flags & STREAM_NOPUSH)
+        return -1;
 
     bits = vint_val2bits(promise->pp_id);
     len = 1 << bits;
@@ -5360,21 +5380,33 @@ lsquic_stream_push_promise (struct lsquic_stream *stream,
     vint_write(promise->pp_encoded_push_id + 8 - len, promise->pp_id,
                                                             bits, 1 << bits);
 
-    if (!stream_activate_hq_frame(stream,
+    shf = stream_activate_hq_frame(stream,
                 stream->sm_payload + stream->sm_n_buffered, HQFT_PUSH_PROMISE,
-                SHF_FIXED_SIZE, pp_reader_size(promise)))
+                SHF_FIXED_SIZE, pp_reader_size(promise));
+    if (!shf)
         return -1;
 
     stream->stream_flags |= STREAM_PUSHING;
 
     init_pp_reader(promise, &pp_reader);
+#ifdef FIU_ENABLE
+    if (fiu_fail("stream/fail_initial_pp_write"))
+    {
+        LSQ_NOTICE("%s: failed to write push promise (fiu)", __func__);
+        nw = -1;
+    }
+    else
+#endif
     nw = stream_write(stream, &pp_reader, SWO_BUFFER);
     if (nw > 0)
     {
         SLIST_INSERT_HEAD(&stream->sm_promises, promise, pp_next);
         ++promise->pp_refcnt;
         if (promise->pp_write_state == PPWS_DONE)
+        {
             LSQ_DEBUG("fully wrote promise %"PRIu64, promise->pp_id);
+            stream->stream_flags &= ~STREAM_PUSHING;
+        }
         else
         {
             LSQ_DEBUG("partially wrote promise %"PRIu64" (state: %d, off: %u)"
@@ -5383,6 +5415,7 @@ lsquic_stream_push_promise (struct lsquic_stream *stream,
             stream->stream_flags |= STREAM_NOPUSH;
             stream->sm_saved_want_write =
                                     !!(stream->sm_qflags & SMQF_WANT_WRITE);
+            lsquic_stream_flush(stream);
             stream_wantwrite(stream, 1);
         }
         return 0;
@@ -5391,6 +5424,7 @@ lsquic_stream_push_promise (struct lsquic_stream *stream,
     {
         if (nw < 0)
             LSQ_WARN("failure writing push promise");
+        stream_hq_frame_put(stream, shf);
         stream->stream_flags |= STREAM_NOPUSH;
         stream->stream_flags &= ~STREAM_PUSHING;
         return -1;

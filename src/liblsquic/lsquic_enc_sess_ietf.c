@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 /*
  * lsquic_enc_sess_ietf.c -- Crypto session for IETF QUIC
  */
@@ -72,10 +72,10 @@ static const struct alpn_map {
     const unsigned char *alpn;
 } s_h3_alpns[] = {
     {   LSQVER_ID27, (unsigned char *) "\x05h3-27",     },
-    {   LSQVER_ID28, (unsigned char *) "\x05h3-28",     },
     {   LSQVER_ID29, (unsigned char *) "\x05h3-29",     },
-    {   LSQVER_ID32, (unsigned char *) "\x05h3-32",     },
-    {   LSQVER_VERNEG, (unsigned char *) "\x05h3-32",     },
+    {   LSQVER_ID34, (unsigned char *) "\x05h3-34",     },
+    {   LSQVER_I001, (unsigned char *) "\x02h3",        },
+    {   LSQVER_VERNEG, (unsigned char *) "\x05h3-34",     },
 };
 
 struct enc_sess_iquic;
@@ -926,6 +926,10 @@ iquic_esfi_create_client (const char *hostname,
             ERR_error_string(ERR_get_error(), errbuf));
         goto err;
     }
+#if BORINGSSL_API_VERSION >= 13
+    SSL_set_quic_use_legacy_codepoint(enc_sess->esi_ssl,
+                            enc_sess->esi_ver_neg->vn_ver < LSQVER_ID34);
+#endif
 
     transpa_len = gen_trans_params(enc_sess, trans_params,
                                                     sizeof(trans_params));
@@ -979,7 +983,7 @@ iquic_esfi_create_client (const char *hostname,
     SSL_set_ex_data(enc_sess->esi_ssl, s_idx, enc_sess);
     SSL_set_connect_state(enc_sess->esi_ssl);
 
-    if (enc_sess->esi_enpub->enp_stream_if->on_sess_resume_info)
+    if (SSL_CTX_sess_get_new_cb(ssl_ctx))
         enc_sess->esi_flags |= ESI_WANT_TICKET;
     enc_sess->esi_alset = alset;
     lsquic_alarmset_init_alarm(enc_sess->esi_alset, AL_SESS_TICKET,
@@ -1014,7 +1018,7 @@ iquic_esfi_create_server (struct lsquic_engine_public *enpub,
                     void *(crypto_streams)[4],
                     const struct crypto_stream_if *cryst_if,
                     const struct lsquic_cid *odcid,
-                    const struct lsquic_cid *iscid )
+                    const struct lsquic_cid *iscid)
 {
     struct enc_sess_iquic *enc_sess;
 
@@ -1109,6 +1113,7 @@ setup_handshake_keys (struct enc_sess_iquic *enc_sess, const lsquic_cid_t *cid)
     struct header_prot *hp;
     size_t hsk_secret_sz, key_len;
     unsigned cliser, i;
+    const unsigned char *salt;
     unsigned char hsk_secret[EVP_MAX_MD_SIZE];
     unsigned char secret[2][SHA256_DIGEST_LENGTH];  /* client, server */
     unsigned char key[2][EVP_MAX_KEY_LENGTH];
@@ -1131,12 +1136,17 @@ setup_handshake_keys (struct enc_sess_iquic *enc_sess, const lsquic_cid_t *cid)
     pair->ykp_thresh = IQUIC_INVALID_PACKNO;
     hp = &enc_sess->esi_hsk_hps[ENC_LEV_CLEAR];
 
+    if (enc_sess->esi_conn->cn_version < LSQVER_ID29)
+        salt = HSK_SALT_PRE29;
+    else if (enc_sess->esi_conn->cn_version < LSQVER_ID34)
+        salt = HSK_SALT_PRE33;
+    else
+        salt = HSK_SALT;
     HKDF_extract(hsk_secret, &hsk_secret_sz, md, cid->idbuf, cid->len,
-                    enc_sess->esi_conn->cn_version < LSQVER_ID29
-                    ? HSK_SALT_PRE29 : HSK_SALT, HSK_SALT_SZ);
+                    salt, HSK_SALT_SZ);
     if (enc_sess->esi_flags & ESI_LOG_SECRETS)
     {
-        LSQ_DEBUG("handshake salt: %s", HEXSTR(HSK_SALT, HSK_SALT_SZ, hexbuf));
+        LSQ_DEBUG("handshake salt: %s", HEXSTR(salt, HSK_SALT_SZ, hexbuf));
         LSQ_DEBUG("handshake secret: %s", HEXSTR(hsk_secret, hsk_secret_sz,
                                                                     hexbuf));
     }
@@ -1382,6 +1392,10 @@ iquic_esfi_init_server (enc_session_t *enc_session_p)
             ERR_error_string(ERR_get_error(), u.errbuf));
         return -1;
     }
+#if BORINGSSL_API_VERSION >= 13
+    SSL_set_quic_use_legacy_codepoint(enc_sess->esi_ssl,
+                            enc_sess->esi_conn->cn_version < LSQVER_ID34);
+#endif
     if (!(SSL_set_quic_method(enc_sess->esi_ssl, &cry_quic_method)))
     {
         LSQ_INFO("could not set stream method");
@@ -1434,10 +1448,14 @@ iquic_esfi_init_server (enc_session_t *enc_session_p)
 } while (0)
 #endif
 
+
+/* Return 0 on success, in which case *buf is newly allocated memory and should
+ * be freed by the caller.
+ */
 static int
-iquic_new_session_cb (SSL *ssl, SSL_SESSION *session)
+iquic_ssl_sess_to_resume_info (struct enc_sess_iquic *enc_sess, SSL *ssl,
+                SSL_SESSION *session, unsigned char **bufp, size_t *buf_szp)
 {
-    struct enc_sess_iquic *enc_sess;
     uint32_t num;
     unsigned char *p, *buf;
     uint8_t *ticket_buf;
@@ -1446,33 +1464,29 @@ iquic_new_session_cb (SSL *ssl, SSL_SESSION *session)
     const uint8_t *trapa_buf;
     size_t trapa_sz, buf_sz;
 
-    enc_sess = SSL_get_ex_data(ssl, s_idx);
-    assert(enc_sess->esi_enpub->enp_stream_if->on_sess_resume_info);
-
-    SSL_get_peer_quic_transport_params(enc_sess->esi_ssl, &trapa_buf,
-                                                                &trapa_sz);
+    SSL_get_peer_quic_transport_params(ssl, &trapa_buf, &trapa_sz);
     if (!(trapa_buf + trapa_sz))
     {
         LSQ_WARN("no transport parameters: cannot generate session "
                                                     "resumption info");
-        return 0;
+        return -1;
     }
     if (trapa_sz > UINT32_MAX)
     {
         LSQ_WARN("trapa size too large: %zu", trapa_sz);
-        return 0;
+        return -1;
     }
 
     if (!SSL_SESSION_to_bytes(session, &ticket_buf, &ticket_sz))
     {
         LSQ_INFO("could not serialize new session");
-        return 0;
+        return -1;
     }
     if (ticket_sz > UINT32_MAX)
     {
         LSQ_WARN("ticket size too large: %zu", ticket_sz);
         OPENSSL_free(ticket_buf);
-        return 0;
+        return -1;
     }
 
     buf_sz = sizeof(tag) + sizeof(uint32_t) + sizeof(uint32_t)
@@ -1481,8 +1495,8 @@ iquic_new_session_cb (SSL *ssl, SSL_SESSION *session)
     if (!buf)
     {
         OPENSSL_free(ticket_buf);
-        LSQ_WARN("%s: malloc failed", __func__);
-        return 0;
+        LSQ_INFO("%s: malloc failed", __func__);
+        return -1;
     }
 
     p = buf;
@@ -1503,8 +1517,26 @@ iquic_new_session_cb (SSL *ssl, SSL_SESSION *session)
 
     LSQ_DEBUG("generated %zu bytes of session resumption buffer", buf_sz);
 
-    enc_sess->esi_enpub->enp_stream_if->on_sess_resume_info(enc_sess->esi_conn,
-                                                                buf, buf_sz);
+    *bufp = buf;
+    *buf_szp = buf_sz;
+    return 0;
+}
+
+
+static int
+iquic_new_session_cb (SSL *ssl, SSL_SESSION *session)
+{
+    struct enc_sess_iquic *enc_sess;
+    unsigned char *buf;
+    size_t buf_sz;
+
+    enc_sess = SSL_get_ex_data(ssl, s_idx);
+    assert(enc_sess->esi_enpub->enp_stream_if->on_sess_resume_info);
+
+    if (0 == iquic_ssl_sess_to_resume_info(enc_sess, ssl, session, &buf,
+                                                                    &buf_sz))
+        enc_sess->esi_enpub->enp_stream_if->on_sess_resume_info(
+                                            enc_sess->esi_conn, buf, buf_sz);
     free(buf);
     enc_sess->esi_flags &= ~ESI_WANT_TICKET;
     lsquic_alarmset_unset(enc_sess->esi_alset, AL_SESS_TICKET);
@@ -1803,6 +1835,36 @@ get_peer_transport_params (struct enc_sess_iquic *enc_sess)
         }
         else
             LSQ_DEBUG("greasing turned off: won't grease the QUIC bit");
+    }
+
+    if (enc_sess->esi_enpub->enp_settings.es_check_tp_sanity
+        /* We only care (and know) about HTTP/3.  Other protocols may have
+         * their own limitations.  The most generic way to do this would be
+         * to factor out transport parameter sanity check into a callback.
+         */
+        && enc_sess->esi_alpn && enc_sess->esi_alpn[0] >= 2
+        && enc_sess->esi_alpn[1] == 'h'
+        && enc_sess->esi_alpn[2] == '3')
+    {
+        const enum transport_param_id stream_data = enc_sess->esi_flags
+            & ESI_SERVER ? TPI_INIT_MAX_STREAM_DATA_BIDI_LOCAL
+                         : TPI_INIT_MAX_STREAM_DATA_BIDI_REMOTE;
+        if (!((trans_params->tp_set & (1 << stream_data))
+                        && trans_params->tp_numerics[stream_data] >= 0x1000))
+        {
+            LSQ_INFO("peer transport parameters: %s=%"PRIu64" does not pass "
+                "sanity check", lsquic_tpi2str[stream_data],
+                trans_params->tp_numerics[stream_data]);
+            return -1;
+        }
+        if (!((trans_params->tp_set & (1 << TPI_INIT_MAX_DATA))
+                    && trans_params->tp_numerics[TPI_INIT_MAX_DATA] >= 0x1000))
+        {
+            LSQ_INFO("peer transport parameters: %s=%"PRIu64" does not pass "
+                "sanity check", lsquic_tpi2str[TPI_INIT_MAX_DATA],
+                trans_params->tp_numerics[TPI_INIT_MAX_DATA]);
+            return -1;
+        }
     }
 
     return 0;
@@ -2410,6 +2472,21 @@ iquic_esf_decrypt_packet (enc_session_t *enc_session_p,
 }
 
 
+static const char *
+iquic_esf_get_sni (enc_session_t *enc_session_p)
+{
+    struct enc_sess_iquic *const enc_sess = enc_session_p;
+    const char *server_name;
+
+    server_name = SSL_get_servername(enc_sess->esi_ssl, TLSEXT_NAMETYPE_host_name);
+#ifndef NDEBUG
+    if (!server_name)
+        server_name = enc_sess->esi_sni_bypass;
+#endif
+    return server_name;
+}
+
+
 static int
 iquic_esf_global_init (int flags)
 {
@@ -2669,6 +2746,7 @@ const struct enc_session_funcs_common lsquic_enc_session_common_ietf_v1 =
     .esf_tag_len         = IQUIC_TAG_LEN,
     .esf_get_server_cert_chain
                          = iquic_esf_get_server_cert_chain,
+    .esf_get_sni         = iquic_esf_get_sni,
     .esf_cipher          = iquic_esf_cipher,
     .esf_keysize         = iquic_esf_keysize,
     .esf_alg_keysize     = iquic_esf_alg_keysize,
@@ -2687,6 +2765,7 @@ const struct enc_session_funcs_common lsquic_enc_session_common_ietf_v1_no_flush
     .esf_tag_len         = IQUIC_TAG_LEN,
     .esf_get_server_cert_chain
                          = iquic_esf_get_server_cert_chain,
+    .esf_get_sni         = iquic_esf_get_sni,
     .esf_cipher          = iquic_esf_cipher,
     .esf_keysize         = iquic_esf_keysize,
     .esf_alg_keysize     = iquic_esf_alg_keysize,
@@ -3262,6 +3341,9 @@ const unsigned char *const lsquic_retry_key_buf[N_IETF_RETRY_VERSIONS] =
     /* [draft-ietf-quic-tls-29] Section 5.8 */
     (unsigned char *)
         "\xcc\xce\x18\x7e\xd0\x9a\x09\xd0\x57\x28\x15\x5a\x6c\xb9\x6b\xe1",
+    /* [draft-ietf-quic-tls-33] Section 5.8 */
+    (unsigned char *)
+        "\xbe\x0c\x69\x0b\x9f\x66\x57\x5a\x1d\x76\x6b\x54\xe3\x68\xc8\x4e",
 };
 
 
@@ -3271,6 +3353,8 @@ const unsigned char *const lsquic_retry_nonce_buf[N_IETF_RETRY_VERSIONS] =
     (unsigned char *) "\x4d\x16\x11\xd0\x55\x13\xa5\x52\xc5\x87\xd5\x75",
     /* [draft-ietf-quic-tls-29] Section 5.8 */
     (unsigned char *) "\xe5\x49\x30\xf9\x7f\x21\x36\xf0\x53\x0a\x8c\x1c",
+    /* [draft-ietf-quic-tls-33] Section 5.8 */
+    (unsigned char *) "\x46\x15\x99\xd3\x5d\x63\x2b\xf2\x23\x98\x25\xbb",
 };
 
 
@@ -3382,4 +3466,29 @@ lsquic_ssl_to_conn (const struct ssl_st *ssl)
         return NULL;
 
     return enc_sess->esi_conn;
+}
+
+
+int
+lsquic_ssl_sess_to_resume_info (SSL *ssl, SSL_SESSION *session,
+                                        unsigned char **buf, size_t *buf_sz)
+{
+    struct enc_sess_iquic *enc_sess;
+    int status;
+
+    if (s_idx < 0)
+        return -1;
+
+    enc_sess = SSL_get_ex_data(ssl, s_idx);
+    if (!enc_sess)
+        return -1;
+
+    status = iquic_ssl_sess_to_resume_info(enc_sess, ssl, session, buf, buf_sz);
+    if (status == 0)
+    {
+        LSQ_DEBUG("%s called successfully, unset WANT_TICKET flag", __func__);
+        enc_sess->esi_flags &= ~ESI_WANT_TICKET;
+        lsquic_alarmset_unset(enc_sess->esi_alset, AL_SESS_TICKET);
+    }
+    return status;
 }

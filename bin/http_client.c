@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 /*
  * http_client.c -- A simple HTTP/QUIC client
  */
@@ -190,6 +190,7 @@ struct http_client_ctx {
     unsigned                     hcc_n_open_conns;
     unsigned                     hcc_reset_after_nbytes;
     unsigned                     hcc_retire_cid_after_nbytes;
+    const char                  *hcc_download_dir;
     
     char                        *hcc_sess_resume_file_name;
 
@@ -425,6 +426,7 @@ http_client_on_hsk_done (lsquic_conn_t *conn, enum lsquic_hsk_status status)
 }
 
 
+/* Now only used for gQUIC and will be going away after that */
 static void
 http_client_on_sess_resume_info (lsquic_conn_t *conn, const unsigned char *buf,
                                                                 size_t bufsz)
@@ -487,6 +489,7 @@ struct lsquic_stream_ctx {
                                      * lsquic_stream_read* functions.
                                      */
     unsigned             count;
+    FILE                *download_fh;
     struct lsquic_reader reader;
 };
 
@@ -552,6 +555,23 @@ http_client_on_new_stream (void *stream_if_ctx, lsquic_stream_t *stream)
         st_h->sh_flags |= ABANDON;
     }
 
+    if (st_h->client_ctx->hcc_download_dir)
+    {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s",
+                            st_h->client_ctx->hcc_download_dir, st_h->path);
+        st_h->download_fh = fopen(path, "wb");
+        if (st_h->download_fh)
+            LSQ_NOTICE("downloading %s to %s", st_h->path, path);
+        else
+        {
+            LSQ_ERROR("cannot open %s for writing: %s", path, strerror(errno));
+            lsquic_stream_close(stream);
+        }
+    }
+    else
+        st_h->download_fh = NULL;
+
     return st_h;
 }
 
@@ -565,13 +585,14 @@ send_headers (lsquic_stream_ctx_t *st_h)
     if (!hostname)
         hostname = st_h->client_ctx->prog->prog_hostname;
     hbuf.off = 0;
-    struct lsxpack_header headers_arr[9];
+    struct lsxpack_header headers_arr[10];
 #define V(v) (v), strlen(v)
     header_set_ptr(&headers_arr[h_idx++], &hbuf, V(":method"), V(st_h->client_ctx->method));
     header_set_ptr(&headers_arr[h_idx++], &hbuf, V(":scheme"), V("https"));
     header_set_ptr(&headers_arr[h_idx++], &hbuf, V(":path"), V(st_h->path));
     header_set_ptr(&headers_arr[h_idx++], &hbuf, V(":authority"), V(hostname));
     header_set_ptr(&headers_arr[h_idx++], &hbuf, V("user-agent"), V(st_h->client_ctx->prog->prog_settings.es_ua));
+    //header_set_ptr(&headers_arr[h_idx++], &hbuf, V("expect"), V("100-continue"));
     if (randomly_reprioritize_streams)
     {
         char pfv[10];
@@ -765,7 +786,7 @@ http_client_on_read (lsquic_stream_t *stream, lsquic_stream_ctx_t *st_h)
             if (client_ctx->hcc_reset_after_nbytes &&
                 s_stat_downloaded_bytes > client_ctx->hcc_reset_after_nbytes)
             {
-                lsquic_stream_reset(stream, 0x1);
+                lsquic_stream_maybe_reset(stream, 0x1, 1);
                 break;
             }
             /* test retire_cid after some number of read bytes */
@@ -785,7 +806,8 @@ http_client_on_read (lsquic_stream_t *stream, lsquic_stream_ctx_t *st_h)
                 st_h->sh_flags |= PROCESSED_HEADERS;
             }
             if (!s_discard_response)
-                fwrite(buf, 1, nread, stdout);
+                fwrite(buf, 1, nread, st_h->download_fh
+                                    ? st_h->download_fh : stdout);
             if (randomly_reprioritize_streams && (st_h->count++ & 0x3F) == 0)
             {
                 if ((1 << lsquic_conn_quic_version(lsquic_stream_conn(stream)))
@@ -887,6 +909,8 @@ http_client_on_close (lsquic_stream_t *stream, lsquic_stream_ctx_t *st_h)
     }
     if (st_h->reader.lsqr_ctx)
         destroy_lsquic_reader_ctx(st_h->reader.lsqr_ctx);
+    if (st_h->download_fh)
+        fclose(st_h->download_fh);
     free(st_h);
 }
 
@@ -899,6 +923,65 @@ static struct lsquic_stream_if http_client_if = {
     .on_write               = http_client_on_write,
     .on_close               = http_client_on_close,
     .on_hsk_done            = http_client_on_hsk_done,
+};
+
+
+/* XXX This function assumes we can send the request in one shot.  This is
+ * not a realistic assumption to make in general, but will work for our
+ * limited use case (QUIC Interop Runner).
+ */
+static void
+hq_client_on_write (struct lsquic_stream *stream, lsquic_stream_ctx_t *st_h)
+{
+    if (st_h->client_ctx->payload)
+    {
+        LSQ_ERROR("payload is not supported in HQ client");
+        lsquic_stream_close(stream);
+        return;
+    }
+
+    lsquic_stream_write(stream, "GET ", 4);
+    lsquic_stream_write(stream, st_h->path, strlen(st_h->path));
+    lsquic_stream_write(stream, "\r\n", 2);
+    lsquic_stream_shutdown(stream, 1);
+    lsquic_stream_wantread(stream, 1);
+}
+
+
+static size_t
+hq_client_print_to_file (void *user_data, const unsigned char *buf,
+                                                size_t buf_len, int fin_unused)
+{
+    fwrite(buf, 1, buf_len, user_data);
+    return buf_len;
+}
+
+
+static void
+hq_client_on_read (struct lsquic_stream *stream, lsquic_stream_ctx_t *st_h)
+{
+    FILE *out = st_h->download_fh ? st_h->download_fh : stdout;
+    ssize_t nread;
+
+    nread = lsquic_stream_readf(stream, hq_client_print_to_file, out);
+    if (nread <= 0)
+    {
+        if (nread < 0)
+            LSQ_WARN("error reading response for %s: %s", st_h->path,
+                                                        strerror(errno));
+        lsquic_stream_close(stream);
+    }
+}
+
+
+/* The "hq" set of callbacks differs only in the read and write routines */
+static struct lsquic_stream_if hq_client_if = {
+    .on_new_conn            = http_client_on_new_conn,
+    .on_conn_closed         = http_client_on_conn_closed,
+    .on_new_stream          = http_client_on_new_stream,
+    .on_read                = hq_client_on_read,
+    .on_write               = hq_client_on_write,
+    .on_close               = http_client_on_close,
 };
 
 
@@ -930,7 +1013,6 @@ usage (const char *prog)
 "   -I          Abort on incomplete reponse from server\n"
 "   -4          Prefer IPv4 when resolving hostname\n"
 "   -6          Prefer IPv6 when resolving hostname\n"
-"   -0 FILE     Provide RTT info file (reading or writing)\n"
 #ifndef WIN32
 "   -C DIR      Certificate store.  If specified, server certificate will\n"
 "                 be verified.\n"
@@ -947,6 +1029,8 @@ usage (const char *prog)
 "   -9 SPEC     Priority specification.  May be specified several times.\n"
 "                 SPEC takes the form stream_id:nread:UI, where U is\n"
 "                 urgency and I is incremental.  Matched \\d+:\\d+:[0-7][01]\n"
+"   -7 DIR      Save fetched resources into this directory.\n"
+"   -Q ALPN     Use hq ALPN.  Specify, for example, \"h3-29\".\n"
             , prog);
 }
 
@@ -1535,6 +1619,8 @@ main (int argc, char **argv)
                                     "46Br:R:IKu:EP:M:n:w:H:p:0:q:e:hatT:b:d:"
                             "3:"    /* 3 is 133+ for "e" ("e" for "early") */
                             "9:"    /* 9 sort of looks like P... */
+                            "7:"    /* Download directory */
+                            "Q:"    /* ALPN, e.g. h3-29 */
 #ifndef WIN32
                                                                       "C:"
 #endif
@@ -1651,7 +1737,7 @@ main (int argc, char **argv)
         case '0':
             http_client_if.on_sess_resume_info = http_client_on_sess_resume_info;
             client_ctx.hcc_sess_resume_file_name = optarg;
-            break;
+            goto common_opts;
         case '3':
             s_abandon_early = strtol(optarg, NULL, 10);
             break;
@@ -1694,6 +1780,16 @@ main (int argc, char **argv)
             s_priority_specs = priority_specs;
             break;
         }
+        case '7':
+            client_ctx.hcc_download_dir = optarg;
+            break;
+        case 'Q':
+            /* XXX A bit hacky, as `prog' has already been initialized... */
+            prog.prog_engine_flags &= ~LSENG_HTTP;
+            prog.prog_api.ea_alpn      = optarg;
+            prog.prog_api.ea_stream_if = &hq_client_if;
+            break;
+        common_opts:
         default:
             if (0 != prog_set_opt(&prog, opt, optarg))
                 exit(1);

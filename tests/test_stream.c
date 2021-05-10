@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 #include <assert.h>
 #include <errno.h>
 #include <stdio.h>
@@ -350,7 +350,9 @@ static const struct conn_iface our_conn_if =
     .ci_write_ack     = write_ack,
 };
 
+#if LSQUIC_CONN_STATS
 static struct conn_stats s_conn_stats;
+#endif
 
 static void
 init_test_objs (struct test_objs *tobjs, unsigned initial_conn_window,
@@ -381,7 +383,9 @@ init_test_objs (struct test_objs *tobjs, unsigned initial_conn_window,
     tobjs->conn_pub.packet_out_malo =
                         lsquic_malo_create(sizeof(struct lsquic_packet_out));
     tobjs->conn_pub.path = &network_path;
+#if LSQUIC_CONN_STATS
     tobjs->conn_pub.conn_stats = &s_conn_stats;
+#endif
     tobjs->initial_stream_window = initial_stream_window;
     lsquic_send_ctl_init(&tobjs->send_ctl, &tobjs->alset, &tobjs->eng_pub,
         &tobjs->ver_neg, &tobjs->conn_pub, 0);
@@ -801,8 +805,15 @@ test_rem_data_loc_close_and_rst_in (struct test_objs *tobjs)
     s = lsquic_stream_shutdown(stream, 1);
     assert(0 == s);
 
-    assert(1 == lsquic_send_ctl_n_scheduled(&tobjs->send_ctl)); /* Shutdown performs a flush */
-    assert(stream->n_unacked == 1);
+    if (stream->sm_bflags & SMBF_IETF)
+    {
+        assert(1 == lsquic_send_ctl_n_scheduled(&tobjs->send_ctl)); /* Shutdown performs a flush */
+        assert(stream->n_unacked == 1);
+    }
+    else
+    {
+        /* gQUIC has RST scheduled to be sent, so no FIN is written */
+    }
 
     assert(!TAILQ_EMPTY(&tobjs->conn_pub.service_streams));
     assert((stream->sm_qflags & (SMQF_SERVICE_FLAGS)) == SMQF_CALL_ONCLOSE);
@@ -820,12 +831,20 @@ test_rem_data_loc_close_and_rst_in (struct test_objs *tobjs)
     assert(stream->sm_qflags & SMQF_CALL_ONCLOSE);
 
     lsquic_stream_rst_frame_sent(stream);
-    stream->n_unacked++;    /* RESET frame take a reference */
-    assert(!(stream->sm_qflags & SMQF_FREE_STREAM));    /* Not yet,
-        because: */ assert(stream->n_unacked == 2);
+    if (stream->sm_bflags & SMBF_IETF)
+    {
+        stream->n_unacked++;    /* RESET frame take a reference */
+        assert(!(stream->sm_qflags & SMQF_FREE_STREAM));    /* Not yet,
+            because: */ assert(stream->n_unacked == 2);
+    }
 
-    lsquic_stream_acked(stream, QUIC_FRAME_STREAM);
-    lsquic_stream_acked(stream, QUIC_FRAME_RST_STREAM);
+    if (stream->sm_bflags & SMBF_IETF)
+    {
+        lsquic_stream_acked(stream, QUIC_FRAME_STREAM);
+        lsquic_stream_acked(stream, QUIC_FRAME_RST_STREAM);
+    }
+    else
+        assert(stream->n_unacked == 0); /* STREAM frame was elided */
     assert(stream->sm_qflags & SMQF_FREE_STREAM);       /* OK, now */
 
     lsquic_stream_destroy(stream);
@@ -869,13 +888,15 @@ test_rem_data_loc_close (struct test_objs *tobjs)
     s = lsquic_stream_shutdown(stream, 1);
     assert(0 == s);
 
-    assert(1 == lsquic_send_ctl_n_scheduled(&tobjs->send_ctl)); /* Shutdown performs a flush */
+    if (stream->sm_bflags & SMBF_IETF)
+        assert(1 == lsquic_send_ctl_n_scheduled(&tobjs->send_ctl)); /* Shutdown performs a flush */
 
     assert(!TAILQ_EMPTY(&tobjs->conn_pub.service_streams));
     assert(stream->sm_qflags & SMQF_CALL_ONCLOSE);
 
     assert(!(stream->sm_qflags & SMQF_FREE_STREAM));
-    lsquic_stream_acked(stream, QUIC_FRAME_STREAM);
+    if (stream->sm_bflags & SMBF_IETF)
+        lsquic_stream_acked(stream, QUIC_FRAME_STREAM);
 
     lsquic_stream_rst_frame_sent(stream);
     stream->n_unacked++;    /* RESET frame take a reference */
@@ -1221,12 +1242,15 @@ test_loc_RST_rem_FIN (struct test_objs *tobjs)
     sss = lsquic_stream_sending_state(stream);
     assert(SSS_SEND == sss);
 
-    lsquic_stream_reset(stream, 0);
+    lsquic_stream_maybe_reset(stream, 0, 1);
     ++stream->n_unacked;    /* Fake sending of packet with RST_STREAM */
     assert(!TAILQ_EMPTY(&tobjs->conn_pub.sending_streams));
     assert((stream->sm_qflags & SMQF_SENDING_FLAGS) == SMQF_SEND_RST);
-    sss = lsquic_stream_sending_state(stream);
-    assert(SSS_DATA_SENT == sss);    /* FIN was packetized */
+    if (stream->sm_bflags & SMBF_IETF)
+    {
+        sss = lsquic_stream_sending_state(stream);
+        assert(SSS_DATA_SENT == sss);    /* FIN was packetized */
+    }
 
     s = lsquic_stream_frame_in(stream, new_frame_in(tobjs, 0, 90, 1));
     assert(s == 0);
@@ -1246,8 +1270,12 @@ test_loc_RST_rem_FIN (struct test_objs *tobjs)
     assert(TAILQ_EMPTY(&tobjs->conn_pub.sending_streams));
 
     lsquic_stream_call_on_close(stream);
-    assert(TAILQ_EMPTY(&tobjs->conn_pub.service_streams));  /* Not acked yet */
-    lsquic_stream_acked(stream, QUIC_FRAME_STREAM);
+
+    if (stream->sm_bflags & SMBF_IETF)
+    {
+        assert(TAILQ_EMPTY(&tobjs->conn_pub.service_streams));  /* Not acked yet */
+        lsquic_stream_acked(stream, QUIC_FRAME_STREAM);
+    }
 
     assert(!TAILQ_EMPTY(&tobjs->conn_pub.service_streams));
     assert((stream->sm_qflags & SMQF_SERVICE_FLAGS) == SMQF_FREE_STREAM);
@@ -1507,7 +1535,7 @@ test_unlimited_stream_flush_data (struct test_objs *tobjs)
     lsquic_stream_flush(stream);
     assert(0x4000 == lsquic_conn_cap_avail(cap));
 
-    lsquic_stream_reset(stream, 0xF00DF00D);
+    lsquic_stream_maybe_reset(stream, 0xF00DF00D, 1);
     assert(0x4000 == lsquic_conn_cap_avail(cap));   /* Still unchanged */
 
     lsquic_stream_destroy(stream);

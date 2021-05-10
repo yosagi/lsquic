@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 /*
  * test_h3_framing.c -- test generation of H3 frames
  */
@@ -331,7 +331,9 @@ static const struct conn_iface our_conn_if =
 };
 
 
+#if LSQUIC_CONN_STATS
 static struct conn_stats s_conn_stats;
+#endif
 
 static void
 init_test_objs (struct test_objs *tobjs, unsigned initial_conn_window,
@@ -361,7 +363,9 @@ init_test_objs (struct test_objs *tobjs, unsigned initial_conn_window,
     tobjs->conn_pub.packet_out_malo =
                         lsquic_malo_create(sizeof(struct lsquic_packet_out));
     tobjs->conn_pub.path = &network_path;
+#if LSQUIC_CONN_STATS
     tobjs->conn_pub.conn_stats = &s_conn_stats;
+#endif
     tobjs->initial_stream_window = initial_stream_window;
     tobjs->eng_pub.enp_settings.es_cc_algo = 1;  /* Cubic */
     tobjs->eng_pub.enp_hsi_if = &tobjs->hsi_if;
@@ -1137,9 +1141,9 @@ fuzz_guided_pwritev_testing (const char *input)
     case 1: version = LSQVER_046; break;
     case 2: version = LSQVER_050; break;
     case 3: version = LSQVER_ID27; break;
-    case 4: version = LSQVER_ID28; break;
+    case 4: version = LSQVER_ID29; break;
     default:
-    case 5: version = LSQVER_ID29; break;
+    case 5: version = LSQVER_ID34; break;
     }
 
     sched_immed = !!(buf[8] & 0x08);
@@ -1463,8 +1467,7 @@ test_reading_zero_size_data_frame (void)
 
     /* Fake out reading of HEADERS frame: */
     stream->stream_flags |= STREAM_HAVE_UH;
-    stream->sm_hq_filter.hqfi_hist_buf = 1 /* CODE_HEADER */;
-    stream->sm_hq_filter.hqfi_hist_idx++;
+    stream->sm_hq_filter.hqfi_flags |= HQFI_FLAG_HEADER;
 
     /* One-byte DATA frame */
     frame = new_frame_in_ext(&tobjs, 0, 3, 0, (uint8_t[3]){ 0, 1, 'a', });
@@ -1520,8 +1523,7 @@ test_reading_zero_size_data_frame_scenario2 (void)
 
     /* Fake out reading of HEADERS frame: */
     stream->stream_flags |= STREAM_HAVE_UH;
-    stream->sm_hq_filter.hqfi_hist_buf = 1 /* CODE_HEADER */;
-    stream->sm_hq_filter.hqfi_hist_idx++;
+    stream->sm_hq_filter.hqfi_flags |= HQFI_FLAG_HEADER;
 
     /* Zero-length DATA frame */
     frame = new_frame_in_ext(&tobjs, 0, 5, 0, (uint8_t[5]){ 0, 1, 'a', 0, 0, });
@@ -1572,8 +1574,7 @@ test_reading_zero_size_data_frame_scenario3 (void)
 
     /* Fake out reading of HEADERS frame: */
     stream->stream_flags |= STREAM_HAVE_UH;
-    stream->sm_hq_filter.hqfi_hist_buf = 1 /* CODE_HEADER */;
-    stream->sm_hq_filter.hqfi_hist_idx++;
+    stream->sm_hq_filter.hqfi_flags |= HQFI_FLAG_HEADER;
 
     /* Zero-length DATA frame */
     frame = new_frame_in_ext(&tobjs, 0, 4, 0, (uint8_t[4]){ 0, 1, 'a', 0, });

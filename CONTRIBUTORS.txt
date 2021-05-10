@@ -1,4 +1,4 @@
-# Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE.
+# Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE.
 In addition to the LiteSpeed QUIC Team, the following people contributed
 to the LiteSpeed QUIC and HTTP/3 Library:
 
@@ -14,6 +14,7 @@ to the LiteSpeed QUIC and HTTP/3 Library:
     - Aaron France -- Shared library support and Lisp bindings
     - Suma Subbarao -- Use callback to supply client's SSL_CTX
     - Paul Sheer -- Callback on arrival of CONNECTION_CLOSE frame
+    - Weiwei Wang -- Some fixes on Windows
 
 Thank you!
 

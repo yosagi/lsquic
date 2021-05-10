@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 /*
  * lsquic_full_conn_ietf.c -- IETF QUIC connection.
  */
@@ -158,6 +158,7 @@ enum more_flags
     MF_SEND_WRONG_COUNTS= 1 << 5,   /* Send wrong ECN counts to peer */
     MF_WANT_DATAGRAM_WRITE  = 1 << 6,
     MF_DOING_0RTT       = 1 << 7,
+    MF_HAVE_HCSI        = 1 << 8,   /* Have HTTP Control Stream Incoming */
 };
 
 
@@ -402,8 +403,6 @@ struct ietf_full_conn
     /* App PNS only, used to calculate was_missing: */
     lsquic_packno_t             ifc_max_ackable_packno_in;
     struct lsquic_send_ctl      ifc_send_ctl;
-    struct lsquic_stream       *ifc_stream_hcsi;    /* HTTP Control Stream Incoming */
-    struct lsquic_stream       *ifc_stream_hcso;    /* HTTP Control Stream Outgoing */
     struct lsquic_conn_public   ifc_pub;
     lsquic_alarmset_t           ifc_alset;
     struct lsquic_set64         ifc_closed_stream_ids[N_SITS];
@@ -424,9 +423,6 @@ struct ietf_full_conn
     struct conn_err             ifc_error;
     unsigned                    ifc_n_delayed_streams;
     unsigned                    ifc_n_cons_unretx;
-    const struct lsquic_stream_if
-                               *ifc_stream_if;
-    void                       *ifc_stream_ctx;
     const struct prio_iter_if  *ifc_pii;
     char                       *ifc_errmsg;
     struct lsquic_engine_public
@@ -452,7 +448,6 @@ struct ietf_full_conn
     unsigned                    ifc_max_retx_since_last_ack;
     lsquic_time_t               ifc_max_ack_delay;
     uint64_t                    ifc_ecn_counts_in[N_PNS][4];
-    uint64_t                    ifc_ecn_counts_out[N_PNS][4];
     lsquic_stream_id_t          ifc_max_req_id;
     struct hcso_writer          ifc_hcso;
     struct http_ctl_stream_in   ifc_hcsi;
@@ -705,8 +700,11 @@ cid_throt_alarm_expired (enum alarm_id al_id, void *ctx,
 static void
 wipe_path (struct ietf_full_conn *conn, unsigned path_id)
 {
+    void *peer_ctx = conn->ifc_paths[path_id].cop_path.np_peer_ctx;
     memset(&conn->ifc_paths[path_id], 0, sizeof(conn->ifc_paths[0]));
     conn->ifc_paths[path_id].cop_path.np_path_id = path_id;
+    conn->ifc_paths[path_id].cop_path.np_peer_ctx = peer_ctx;
+    conn->ifc_used_paths &= ~(1 << path_id);
 }
 
 
@@ -729,7 +727,8 @@ path_chal_alarm_expired (enum alarm_id al_id, void *ctx,
         LSQ_INFO("migration to path #%u failed after none of %u path "
             "challenges received responses", path_id, copath->cop_n_chals);
         /* There may be a lingering challenge if its generation is delayed */
-        lsquic_send_ctl_cancel_chals(&conn->ifc_send_ctl, &copath->cop_path);
+        lsquic_send_ctl_cancel_path_verification(&conn->ifc_send_ctl,
+                                                        &copath->cop_path);
         wipe_path(conn, path_id);
     }
     else
@@ -1181,7 +1180,7 @@ ietf_full_conn_add_scid (struct ietf_full_conn *conn,
     }
 
     if (enpub->enp_settings.es_scid_len)
-        enpub->enp_generate_scid(lconn, &cce->cce_cid,
+        enpub->enp_generate_scid(enpub->enp_gen_scid_ctx, lconn, &cce->cce_cid,
                                             enpub->enp_settings.es_scid_len);
 
     cce->cce_seqno = conn->ifc_scid_seqno++;
@@ -1669,7 +1668,6 @@ lsquic_ietf_full_conn_server_new (struct lsquic_engine_public *enpub,
         for (i = 0; i < 4; ++i)
         {
             conn->ifc_ecn_counts_in[pns][i]  = imc->imc_ecn_counts_in[pns][i];
-            conn->ifc_ecn_counts_out[pns][i] = imc->imc_ecn_counts_out[pns][i];
         }
     conn->ifc_incoming_ecn = imc->imc_incoming_ecn;
     conn->ifc_pub.rtt_stats = imc->imc_rtt_stats;
@@ -2037,6 +2035,7 @@ can_issue_cids (const struct ietf_full_conn *conn)
 
     can = ((1 << conn->ifc_conn.cn_n_cces) - 1
                                             != conn->ifc_conn.cn_cces_mask)
+       && conn->ifc_enpub->enp_settings.es_scid_len
        && conn->ifc_active_cids_count < conn->ifc_active_cids_limit;
     LSQ_DEBUG("can issue CIDs: %d (n_cces %hhu; mask: 0x%hhX; "
                                         "active: %hhu; limit: %hhu)",
@@ -2578,8 +2577,11 @@ generate_rst_stream_frame (struct ietf_full_conn *conn,
     lsquic_send_ctl_incr_pack_sz(&conn->ifc_send_ctl, packet_out, sz);
     packet_out->po_frame_types |= 1 << QUIC_FRAME_RST_STREAM;
     lsquic_stream_rst_frame_sent(stream);
-    LSQ_DEBUG("wrote RST: stream %"PRIu64"; offset 0x%"PRIX64"; error code "
+    LSQ_DEBUG("wrote RST: stream %"PRIu64"; offset %"PRIu64"; error code "
               "%"PRIu64, stream->id, stream->tosend_off, stream->error_code);
+    EV_LOG_CONN_EVENT(LSQUIC_LOG_CONN_ID, "generated RESET_STREAM: stream "
+        "%"PRIu64"; offset %"PRIu64"; error code %"PRIu64, stream->id,
+        stream->tosend_off, stream->error_code);
 
     return 1;
 }
@@ -2754,6 +2756,20 @@ have_bidi_streams (const struct ietf_full_conn *conn)
 }
 
 
+static int
+conn_ok_to_close (const struct ietf_full_conn *conn)
+{
+    assert(conn->ifc_flags & IFC_CLOSING);
+    return !(conn->ifc_flags & IFC_SERVER)
+        || (conn->ifc_flags & IFC_RECV_CLOSE)
+        || (
+               !lsquic_send_ctl_have_outgoing_stream_frames(&conn->ifc_send_ctl)
+            && !have_bidi_streams(conn)
+            && lsquic_send_ctl_have_unacked_stream_frames(
+                                                    &conn->ifc_send_ctl) == 0);
+}
+
+
 static void
 maybe_close_conn (struct ietf_full_conn *conn)
 {
@@ -2762,8 +2778,13 @@ maybe_close_conn (struct ietf_full_conn *conn)
         && !have_bidi_streams(conn))
     {
         conn->ifc_flags |= IFC_CLOSING|IFC_GOAWAY_CLOSE;
-        conn->ifc_send_flags |= SF_SEND_CONN_CLOSE;
-        LSQ_DEBUG("closing connection: GOAWAY sent and no responses remain");
+        LSQ_DEBUG("maybe_close_conn: GOAWAY sent and no responses remain");
+        if (conn_ok_to_close(conn))
+        {
+            conn->ifc_send_flags |= SF_SEND_CONN_CLOSE;
+            LSQ_DEBUG("maybe_close_conn: ok to close: "
+                      "schedule to send CONNECTION_CLOSE");
+        }
     }
 }
 
@@ -2916,10 +2937,15 @@ ietf_full_conn_ci_close (struct lsquic_conn *lconn)
             stream = lsquic_hashelem_getdata(el);
             sd = (stream->id >> SD_SHIFT) & 1;
             if (SD_BIDI == sd)
-                lsquic_stream_shutdown_internal(stream);
+                lsquic_stream_maybe_reset(stream, 0, 1);
         }
         conn->ifc_flags |= IFC_CLOSING;
-        conn->ifc_send_flags |= SF_SEND_CONN_CLOSE;
+        if (conn_ok_to_close(conn))
+        {
+            conn->ifc_send_flags |= SF_SEND_CONN_CLOSE;
+            LSQ_DEBUG("ietf_full_conn_ci_close: ok to close: "
+                      "schedule to send CONNECTION_CLOSE");
+        }
         lsquic_engine_add_conn_to_tickable(conn->ifc_enpub, lconn);
     }
 }
@@ -2931,6 +2957,7 @@ ietf_full_conn_ci_abort (struct lsquic_conn *lconn)
     struct ietf_full_conn *conn = (struct ietf_full_conn *) lconn;
     LSQ_INFO("User aborted connection");
     conn->ifc_flags |= IFC_ABORTED;
+    lsquic_engine_add_conn_to_tickable(conn->ifc_enpub, lconn);
 }
 
 
@@ -3202,7 +3229,8 @@ ietf_full_conn_ci_going_away (struct lsquic_conn *lconn)
     {
         if (!(conn->ifc_flags & (IFC_CLOSING|IFC_GOING_AWAY)))
         {
-            LSQ_INFO("connection marked as going away");
+            LSQ_INFO("connection marked as going away, last stream: %ld",
+                     conn->ifc_max_req_id);
             conn->ifc_flags |= IFC_GOING_AWAY;
             const lsquic_stream_id_t stream_id = conn->ifc_max_req_id + N_SITS;
             if (valid_stream_id(stream_id))
@@ -3310,7 +3338,7 @@ try_to_begin_migration (struct ietf_full_conn *conn,
         return BM_NOT_MIGRATING;
     }
 
-    if (conn->ifc_conn.cn_version <= LSQVER_ID28 /* Starting with ID-29,
+    if (conn->ifc_conn.cn_version <= LSQVER_ID27 /* Starting with ID-29,
         disable_active_migration TP applies only to the time period during
         the handshake.  Our client does not migrate during the handshake:
         this code runs only after handshake has succeeded. */
@@ -3768,7 +3796,7 @@ handshake_ok (struct lsquic_conn *lconn)
     if (conn->ifc_settings->es_dplpmtud)
         conn->ifc_mflags |= MF_CHECK_MTU_PROBE;
 
-    if (can_issue_cids(conn) && CN_SCID(&conn->ifc_conn)->len != 0)
+    if (can_issue_cids(conn))
         conn->ifc_send_flags |= SF_SEND_NEW_CID;
     maybe_create_delayed_streams(conn);
 
@@ -3990,6 +4018,7 @@ ietf_full_conn_ci_push_stream (struct lsquic_conn *lconn, void *hset,
     uh->uh_exclusive     = 0;
     uh->uh_flags         = UH_FIN;
     uh->uh_hset          = hset;
+    uh->uh_next          = NULL;
 
     memset(promise, 0, sizeof(*promise));
     promise->pp_refcnt = 1; /* This function itself keeps a reference */
@@ -4113,6 +4142,13 @@ ietf_full_conn_ci_is_tickable (struct lsquic_conn *lconn)
                 stream->id);
             return 1;
         }
+
+    if (conn->ifc_flags & IFC_IMMEDIATE_CLOSE_FLAGS)
+    {
+        LSQ_DEBUG("tickable: immediate close flags: 0x%X",
+            (unsigned) (conn->ifc_flags & IFC_IMMEDIATE_CLOSE_FLAGS));
+        return 1;
+    }
 
     LSQ_DEBUG("not tickable");
     return 0;
@@ -4328,20 +4364,6 @@ process_streams_write_events (struct ietf_full_conn *conn, int high_prio)
     conn->ifc_pii->pii_cleanup(&pi);
 
     maybe_conn_flush_special_streams(conn);
-}
-
-
-static int
-conn_ok_to_close (const struct ietf_full_conn *conn)
-{
-    assert(conn->ifc_flags & IFC_CLOSING);
-    return !(conn->ifc_flags & IFC_SERVER)
-        || (conn->ifc_flags & IFC_RECV_CLOSE)
-        || (
-               !lsquic_send_ctl_have_outgoing_stream_frames(&conn->ifc_send_ctl)
-            && !have_bidi_streams(conn)
-            && lsquic_send_ctl_have_unacked_stream_frames(
-                                                    &conn->ifc_send_ctl) == 0);
 }
 
 
@@ -5925,8 +5947,6 @@ static unsigned
 process_connection_close_frame (struct ietf_full_conn *conn,
         struct lsquic_packet_in *packet_in, const unsigned char *p, size_t len)
 {
-    lsquic_stream_t *stream;
-    struct lsquic_hash_elem *el;
     uint64_t error_code;
     uint16_t reason_len;
     uint8_t reason_off;
@@ -5963,17 +5983,7 @@ process_connection_close_frame (struct ietf_full_conn *conn,
     if (conn->ifc_enpub->enp_stream_if->on_conncloseframe_received)
         conn->ifc_enpub->enp_stream_if->on_conncloseframe_received(
             &conn->ifc_conn, app_error, error_code, (const char *) p + reason_off, reason_len);
-    conn->ifc_flags |= IFC_RECV_CLOSE;
-    if (!(conn->ifc_flags & IFC_CLOSING))
-    {
-        for (el = lsquic_hash_first(conn->ifc_pub.all_streams); el;
-                             el = lsquic_hash_next(conn->ifc_pub.all_streams))
-        {
-            stream = lsquic_hashelem_getdata(el);
-            lsquic_stream_shutdown_internal(stream);
-        }
-        conn->ifc_flags |= IFC_CLOSING;
-    }
+    conn->ifc_flags |= IFC_RECV_CLOSE|IFC_CLOSING;
     return parsed_len;
 }
 
@@ -6388,6 +6398,13 @@ process_new_token_frame (struct ietf_full_conn *conn,
     {
         ABORT_QUIETLY(0, TEC_FRAME_ENCODING_ERROR, "received an empty "
             "NEW_TOKEN frame");
+        return 0;
+    }
+
+    if (conn->ifc_flags & IFC_SERVER)
+    {   /* [draft-ietf-quic-transport-34] Section 19.7 */
+        ABORT_QUIETLY(0, TEC_PROTOCOL_VIOLATION,
+                                    "received unexpected NEW_TOKEN frame");
         return 0;
     }
 
@@ -6856,17 +6873,22 @@ parse_regular_packet (struct ietf_full_conn *conn,
     p = packet_in->pi_data + packet_in->pi_header_sz;
     pend = packet_in->pi_data + packet_in->pi_data_sz;
 
-    while (p < pend)
-    {
-        len = process_packet_frame(conn, packet_in, p, pend - p);
-        if (len > 0)
-            p += len;
-        else
+    if (p < pend)
+        do
         {
-            ABORT_ERROR("Error parsing frame");
-            break;
+            len = process_packet_frame(conn, packet_in, p, pend - p);
+            if (len > 0)
+                p += len;
+            else
+            {
+                ABORT_ERROR("Error parsing frame");
+                break;
+            }
         }
-    }
+        while (p < pend);
+    else
+        ABORT_QUIETLY(0, TEC_PROTOCOL_VIOLATION,
+            "packet %"PRIu64" has no frames", packet_in->pi_packno);
 }
 
 
@@ -7365,8 +7387,7 @@ process_regular_packet (struct ietf_full_conn *conn,
                                                     packet_in->pi_received);
     switch (st) {
     case REC_ST_OK:
-        if (!(conn->ifc_flags & (IFC_SERVER|IFC_DCID_SET))
-                                                && (packet_in->pi_scid_len))
+        if (!(conn->ifc_flags & (IFC_SERVER|IFC_DCID_SET)))
             record_dcid(conn, packet_in);
         saved_path_id = conn->ifc_cur_path_id;
         parse_regular_packet(conn, packet_in);
@@ -7567,16 +7588,16 @@ process_incoming_packet_verneg (struct ietf_full_conn *conn,
          */
         if (!verneg_ok(conn))
         {
-            ABORT_ERROR("version negotiation not permitted in this version "
-                                                                    "of QUIC");
+            ABORT_WITH_FLAG(conn, LSQ_LOG_NOTICE, IFC_ERROR|IFC_HSK_FAILED,
+                "version negotiation not permitted in this version of QUIC");
             return -1;
         }
 
         versions &= conn->ifc_u.cli.ifcli_ver_neg.vn_supp;
         if (0 == versions)
         {
-            ABORT_ERROR("client does not support any of the server-specified "
-                        "versions");
+            ABORT_WITH_FLAG(conn, LSQ_LOG_NOTICE, IFC_ERROR|IFC_HSK_FAILED,
+                "client does not support any of the server-specified versions");
             return -1;
         }
 
@@ -7664,13 +7685,12 @@ ietf_full_conn_ci_packet_too_large (struct lsquic_conn *lconn,
     assert(packet_out->po_lflags & POL_HEADER_PROT);
 #endif
 
-    lsquic_senhist_add(&conn->ifc_send_ctl.sc_senhist, packet_out->po_packno);
-    lsquic_send_ctl_sanity_check(&conn->ifc_send_ctl);
     if (packet_out->po_flags & PO_MTU_PROBE)
     {
         LSQ_DEBUG("%zu-byte MTU probe in packet %"PRIu64" is too large",
             lsquic_packet_out_sent_sz(&conn->ifc_conn, packet_out),
             packet_out->po_packno);
+        lsquic_send_ctl_mtu_not_sent(&conn->ifc_send_ctl, packet_out);
         mtu_probe_too_large(conn, packet_out);
     }
     else
@@ -7729,8 +7749,6 @@ ietf_full_conn_ci_packet_sent (struct lsquic_conn *lconn,
     s = lsquic_send_ctl_sent_packet(&conn->ifc_send_ctl, packet_out);
     if (s != 0)
         ABORT_ERROR("sent packet failed: %s", strerror(errno));
-    ++conn->ifc_ecn_counts_out[ lsquic_packet_out_pns(packet_out) ]
-                              [ lsquic_packet_out_ecn(packet_out) ];
     /* Set blocked keep-alive for a [1,8] seconds */
     if (packet_out->po_frame_types
                             & (QUIC_FTBIT_BLOCKED|QUIC_FTBIT_STREAM_BLOCKED))
@@ -8068,7 +8086,8 @@ ietf_full_conn_ci_set_min_datagram_size (struct lsquic_conn *lconn,
 
     if (new_size > USHRT_MAX)
     {
-        LSQ_DEBUG("min datagram size cannot be larger than %hu", USHRT_MAX);
+        LSQ_DEBUG("min datagram size cannot be larger than %hu",
+                                                    (unsigned short) USHRT_MAX);
         return -1;
     }
 
@@ -8319,7 +8338,9 @@ ietf_full_conn_ci_tick (struct lsquic_conn *lconn, lsquic_time_t now)
     lsquic_send_ctl_maybe_app_limited(&conn->ifc_send_ctl, CUR_NPATH(conn));
 
   end_write:
-    if ((conn->ifc_flags & IFC_CLOSING) && conn_ok_to_close(conn))
+    if ((conn->ifc_flags & IFC_CLOSING)
+        && ((conn->ifc_send_flags & SF_SEND_CONN_CLOSE)
+            || conn_ok_to_close(conn)))
     {
         LSQ_DEBUG("connection is OK to close");
         conn->ifc_flags |= IFC_TICK_CLOSE;
@@ -8441,7 +8462,12 @@ ietf_full_conn_ci_status (struct lsquic_conn *lconn, char *errbuf, size_t bufsz)
     }
 
     if (conn->ifc_flags & IFC_ERROR)
-        return LSCONN_ST_ERROR;
+    {
+        if (conn->ifc_flags & IFC_HSK_FAILED)
+            return LSCONN_ST_VERNEG_FAILURE;
+        else
+            return LSCONN_ST_ERROR;
+    }
     if (conn->ifc_flags & IFC_TIMED_OUT)
         return LSCONN_ST_TIMED_OUT;
     if (conn->ifc_flags & IFC_ABORTED)
@@ -8544,6 +8570,8 @@ ietf_full_conn_ci_abort_error (struct lsquic_conn *lconn, int is_app,
     const char *err_str, *percent;
     char err_buf[0x100];
 
+    if (conn->ifc_error.u.err != 0)
+        return;
     percent = strchr(fmt, '%');
     if (percent)
     {
@@ -8881,6 +8909,7 @@ cancel_push_promise (struct ietf_full_conn *conn, struct push_promise *promise)
     /* But let stream dtor free the promise object as sm_promise may yet
      * be used by the stream in some ways.
      */
+    /* TODO: drop lsquic_stream_shutdown_internal, use something else */
     lsquic_stream_shutdown_internal(promise->pp_pushed_stream);
     if (0 != lsquic_hcso_write_cancel_push(&conn->ifc_hcso, promise->pp_id))
         ABORT_WARN("cannot write CANCEL_PUSH");
@@ -8956,7 +8985,8 @@ on_settings_frame (void *ctx)
     LSQ_DEBUG("SETTINGS frame");
     if (conn->ifc_flags & IFC_HAVE_PEER_SET)
     {
-        ABORT_WARN("second incoming SETTING frame on HTTP control stream");
+        ABORT_QUIETLY(1, HEC_FRAME_UNEXPECTED,
+            "second incoming SETTING frame on HTTP control stream");
         return;
     }
 
@@ -9040,7 +9070,7 @@ on_goaway_server_27 (void *ctx, uint64_t stream_id)
 
 
 static void
-on_goaway_client_28 (void *ctx, uint64_t stream_id)
+on_goaway_client_27 (void *ctx, uint64_t stream_id)
 {
     struct ietf_full_conn *const conn = ctx;
     struct lsquic_stream *stream;
@@ -9322,11 +9352,15 @@ on_priority_update_server (void *ctx, enum hq_frame_type frame_type,
 
 
 static void
-on_unexpected_frame (void *ctx, uint64_t frame_type)
+on_frame_error (void *ctx, unsigned code, uint64_t frame_type)
 {
     struct ietf_full_conn *const conn = ctx;
-    ABORT_QUIETLY(1, HEC_FRAME_UNEXPECTED, "Frame type %"PRIu64" is not "
-        "allowed on the control stream", frame_type);
+    if (code == HEC_MISSING_SETTINGS)
+        ABORT_QUIETLY(1, code, "The first control frame is not SETTINGS, "
+                     "got frame type %"PRIu64, frame_type);
+    else
+        ABORT_QUIETLY(1, HEC_FRAME_UNEXPECTED, "Frame type %"PRIu64" is not "
+            "allowed on the control stream", frame_type);
 }
 
 
@@ -9337,7 +9371,7 @@ static const struct hcsi_callbacks hcsi_callbacks_server_27 =
     .on_settings_frame      = on_settings_frame,
     .on_setting             = on_setting,
     .on_goaway              = on_goaway_server_27,
-    .on_unexpected_frame    = on_unexpected_frame,
+    .on_frame_error         = on_frame_error,
     .on_priority_update     = on_priority_update_server,
 };
 
@@ -9347,31 +9381,8 @@ static const struct hcsi_callbacks hcsi_callbacks_client_27 =
     .on_max_push_id         = on_max_push_id_client,
     .on_settings_frame      = on_settings_frame,
     .on_setting             = on_setting,
-    .on_goaway              = on_goaway_client_28 /* sic */,
-    .on_unexpected_frame    = on_unexpected_frame,
-    .on_priority_update     = on_priority_update_client,
-};
-
-
-static const struct hcsi_callbacks hcsi_callbacks_server_28 =
-{
-    .on_cancel_push         = on_cancel_push_server,
-    .on_max_push_id         = on_max_push_id,
-    .on_settings_frame      = on_settings_frame,
-    .on_setting             = on_setting,
-    .on_goaway              = on_goaway_server /* sic */,
-    .on_unexpected_frame    = on_unexpected_frame,
-    .on_priority_update     = on_priority_update_server,
-};
-
-static const struct hcsi_callbacks hcsi_callbacks_client_28 =
-{
-    .on_cancel_push         = on_cancel_push_client,
-    .on_max_push_id         = on_max_push_id_client,
-    .on_settings_frame      = on_settings_frame,
-    .on_setting             = on_setting,
-    .on_goaway              = on_goaway_client_28,
-    .on_unexpected_frame    = on_unexpected_frame,
+    .on_goaway              = on_goaway_client_27,
+    .on_frame_error         = on_frame_error,
     .on_priority_update     = on_priority_update_client,
 };
 
@@ -9383,7 +9394,7 @@ static const struct hcsi_callbacks hcsi_callbacks_server_29 =
     .on_settings_frame      = on_settings_frame,
     .on_setting             = on_setting,
     .on_goaway              = on_goaway_server,
-    .on_unexpected_frame    = on_unexpected_frame,
+    .on_frame_error         = on_frame_error,
     .on_priority_update     = on_priority_update_server,
 };
 
@@ -9394,7 +9405,7 @@ static const struct hcsi_callbacks hcsi_callbacks_client_29 =
     .on_settings_frame      = on_settings_frame,
     .on_setting             = on_setting,
     .on_goaway              = on_goaway_client,
-    .on_unexpected_frame    = on_unexpected_frame,
+    .on_frame_error         = on_frame_error,
     .on_priority_update     = on_priority_update_client,
 };
 
@@ -9405,7 +9416,7 @@ hcsi_on_new (void *stream_if_ctx, struct lsquic_stream *stream)
     struct ietf_full_conn *const conn = (void *) stream_if_ctx;
     const struct hcsi_callbacks *callbacks;
 
-    conn->ifc_stream_hcsi = stream;
+    conn->ifc_mflags |= MF_HAVE_HCSI;
 
     switch ((!!(conn->ifc_flags & IFC_SERVER) << 8) | conn->ifc_conn.cn_version)
     {
@@ -9415,21 +9426,17 @@ hcsi_on_new (void *stream_if_ctx, struct lsquic_stream *stream)
         case (1 << 8) | LSQVER_ID27:
             callbacks = &hcsi_callbacks_server_27;
             break;
-        case (0 << 8) | LSQVER_ID28:
-            callbacks = &hcsi_callbacks_client_28;
-            break;
-        case (1 << 8) | LSQVER_ID28:
-            callbacks = &hcsi_callbacks_server_28;
-            break;
         case (0 << 8) | LSQVER_ID29:
-        case (0 << 8) | LSQVER_ID32:
+        case (0 << 8) | LSQVER_ID34:
+        case (0 << 8) | LSQVER_I001:
             callbacks = &hcsi_callbacks_client_29;
             break;
         default:
             assert(0);
             /* fallthru */
         case (1 << 8) | LSQVER_ID29:
-        case (1 << 8) | LSQVER_ID32:
+        case (1 << 8) | LSQVER_ID34:
+        case (1 << 8) | LSQVER_I001:
             callbacks = &hcsi_callbacks_server_29;
             break;
     }
@@ -9499,8 +9506,6 @@ hcsi_on_write (struct lsquic_stream *stream, lsquic_stream_ctx_t *ctx)
 static void
 hcsi_on_close (struct lsquic_stream *stream, lsquic_stream_ctx_t *ctx)
 {
-    struct ietf_full_conn *const conn = (void *) ctx;
-    conn->ifc_stream_hcsi = NULL;
 }
 
 
@@ -9520,7 +9525,7 @@ apply_uni_stream_class (struct ietf_full_conn *conn,
     switch (stream_type)
     {
     case HQUST_CONTROL:
-        if (!conn->ifc_stream_hcsi)
+        if (!(conn->ifc_mflags & MF_HAVE_HCSI))
         {
             LSQ_DEBUG("Incoming HTTP control stream ID: %"PRIu64,
                                                             stream->id);
@@ -9529,9 +9534,7 @@ apply_uni_stream_class (struct ietf_full_conn *conn,
         else
         {
             ABORT_QUIETLY(1, HEC_STREAM_CREATION_ERROR,
-                "Control stream %"PRIu64" already exists: cannot create "
-                "second control stream %"PRIu64, conn->ifc_stream_hcsi->id,
-                stream->id);
+                "Attempt to create second control stream");
             lsquic_stream_close(stream);
         }
         break;

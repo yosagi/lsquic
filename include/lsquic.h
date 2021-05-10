@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 #ifndef __LSQUIC_H__
 #define __LSQUIC_H__
 
@@ -24,8 +24,8 @@ extern "C" {
 #endif
 
 #define LSQUIC_MAJOR_VERSION 2
-#define LSQUIC_MINOR_VERSION 27
-#define LSQUIC_PATCH_VERSION 0
+#define LSQUIC_MINOR_VERSION 30
+#define LSQUIC_PATCH_VERSION 2
 
 /**
  * Engine flags:
@@ -82,19 +82,20 @@ enum lsquic_version
     LSQVER_ID27,
 
     /**
-     * IETF QUIC Draft-28; this version is deprecated.
-     */
-    LSQVER_ID28,
-
-    /**
      * IETF QUIC Draft-29
      */
     LSQVER_ID29,
 
     /**
-     * IETF QUIC Draft-32
+     * IETF QUIC Draft-34
      */
-    LSQVER_ID32,
+    LSQVER_ID34,
+
+    /**
+     * IETF QUIC v1.  Functionally the same as Draft-34, but marked
+     * experimental for now.
+     */
+    LSQVER_I001,
 
     /**
      * Special version to trigger version negotiation.
@@ -106,8 +107,8 @@ enum lsquic_version
 };
 
 /**
- * We currently support versions 43, 46, 50, Draft-27, Draft-28, Draft-29,
- * and Draft-32.
+ * We currently support versions 43, 46, 50, Draft-27, Draft-29, Draft-34,
+ * and IETF QUIC v1.
  * @see lsquic_version
  */
 #define LSQUIC_SUPPORTED_VERSIONS ((1 << N_LSQVER) - 1)
@@ -118,19 +119,21 @@ enum lsquic_version
 #define LSQUIC_FORCED_TCID0_VERSIONS ((1 << LSQVER_046)|(1 << LSQVER_050))
 
 #define LSQUIC_EXPERIMENTAL_VERSIONS ( \
+                            (1 << LSQVER_I001) | \
                             (1 << LSQVER_VERNEG) | LSQUIC_EXPERIMENTAL_Q098)
 
-#define LSQUIC_DEPRECATED_VERSIONS ((1 << LSQVER_ID27) | (1 << LSQVER_ID28))
+#define LSQUIC_DEPRECATED_VERSIONS ((1 << LSQVER_ID27))
 
 #define LSQUIC_GQUIC_HEADER_VERSIONS (1 << LSQVER_043)
 
-#define LSQUIC_IETF_VERSIONS ((1 << LSQVER_ID27) | (1 << LSQVER_ID28) \
+#define LSQUIC_IETF_VERSIONS ((1 << LSQVER_ID27) \
                           | (1 << LSQVER_ID29) \
-                          | (1 << LSQVER_ID32) | (1 << LSQVER_VERNEG))
+                          | (1 << LSQVER_ID34) \
+                          | (1 << LSQVER_I001) | (1 << LSQVER_VERNEG))
 
-#define LSQUIC_IETF_DRAFT_VERSIONS ((1 << LSQVER_ID27) | (1 << LSQVER_ID28) \
+#define LSQUIC_IETF_DRAFT_VERSIONS ((1 << LSQVER_ID27) \
                                   | (1 << LSQVER_ID29) \
-                                  | (1 << LSQVER_ID32) | (1 << LSQVER_VERNEG))
+              | (1 << LSQVER_ID34) | (1 << LSQVER_VERNEG))
 
 enum lsquic_hsk_status
 {
@@ -208,6 +211,11 @@ struct lsquic_stream_if {
     /**
      * This optional callback lets client record information needed to
      * perform a session resumption next time around.
+     *
+     * For IETF QUIC, this is called only if ea_get_ssl_ctx() is *not* set,
+     * in which case the library creates its own SSL_CTX.
+     *
+     * Note: this callback will be deprecated when gQUIC support is removed.
      */
     void (*on_sess_resume_info)(lsquic_conn_t *c, const unsigned char *, size_t);
     /**
@@ -234,6 +242,7 @@ struct lsquic_stream_if {
 
 struct ssl_ctx_st;
 struct ssl_st;
+struct ssl_session_st;
 struct lsxpack_header;
 
 /**
@@ -433,6 +442,15 @@ typedef struct ssl_ctx_st * (*lsquic_lookup_cert_f)(
 
 /** By default, calling on_close() is not delayed */
 #define LSQUIC_DF_DELAY_ONCLOSE 0
+
+/**
+ * By default, maximum batch size is not specified, leaving it up to the
+ * library.
+ */
+#define LSQUIC_DF_MAX_BATCH_SIZE 0
+
+/** Transport parameter sanity checks are performed by default. */
+#define LSQUIC_DF_CHECK_TP_SANITY 1
 
 struct lsquic_engine_settings {
     /**
@@ -1038,6 +1056,24 @@ struct lsquic_engine_settings {
      * Default value is @ref LSQUIC_DF_DELAY_ONCLOSE
      */
     int             es_delay_onclose;
+
+    /**
+     * If set to a non-zero value, specified maximum batch size.  (The
+     * batch of packets passed to @ref ea_packets_out() callback).  Must
+     * be no larger than 1024.
+     *
+     * Default value is @ref LSQUIC_DF_MAX_BATCH_SIZE
+     */
+    unsigned        es_max_batch_size;
+
+    /**
+     * When true, sanity checks are performed on peer's transport parameter
+     * values.  If some limits are set suspiciously low, the connection won't
+     * be established.
+     *
+     * Default value is @ref LSQUIC_DF_CHECK_TP_SANITY
+     */
+    int             es_check_tp_sanity;
 };
 
 /* Initialize `settings' to default values */
@@ -1305,13 +1341,13 @@ struct lsquic_engine_api
      */
     const struct lsquic_hset_if         *ea_hsi_if;
     void                                *ea_hsi_ctx;
-#if LSQUIC_CONN_STATS
+
     /**
      * If set, engine will print cumulative connection statistics to this
-     * file just before it is destroyed.
+     * file just before it is destroyed.  (Must be compiled with
+     * -DLSQUIC_CONN_STATS=1).
      */
     void /* FILE, really */             *ea_stats_fh;
-#endif
 
     /**
      * The optional ALPN string is used by the client if @ref LSENG_HTTP
@@ -1322,8 +1358,10 @@ struct lsquic_engine_api
     /**
      * Optional interface to control the creation of connection IDs
      */
-    void                               (*ea_generate_scid)(lsquic_conn_t *,
-                                                    lsquic_cid_t *, unsigned);
+    void                               (*ea_generate_scid)(void *ctx,
+                                lsquic_conn_t *, lsquic_cid_t *, unsigned);
+    /** Passed to ea_generate_scid() */
+    void                                *ea_gen_scid_ctx;
 };
 
 /**
@@ -1964,6 +2002,10 @@ lsquic_conn_set_ctx (lsquic_conn_t *, lsquic_conn_ctx_t *);
 void *
 lsquic_conn_get_peer_ctx (lsquic_conn_t *, const struct sockaddr *local_sa);
 
+/** Get SNI sent by the client */
+const char *
+lsquic_conn_get_sni (lsquic_conn_t *);
+
 /**
  * Abort connection.
  */
@@ -2004,6 +2046,18 @@ int
 lsquic_cid_from_packet (const unsigned char *, size_t bufsz, lsquic_cid_t *cid);
 
 /**
+ * On success, offset to the CID is returned (a non-negative value).
+ * `cid_len' is set to the length of the CID.  The server perspective
+ * is assumed.  `server_cid_len' is set to the length of the CIDs that
+ * server generates.
+ *
+ * On failure, a negative value is returned.
+ */
+int
+lsquic_dcid_from_packet (const unsigned char *, size_t bufsz,
+                                unsigned server_cid_len, unsigned *cid_len);
+
+/**
  * Returns true if there are connections to be processed, false otherwise.
  * If true, `diff' is set to the difference between the earliest advisory
  * tick time and now.  If the former is in the past, the value of `diff'
@@ -2034,6 +2088,7 @@ enum LSQUIC_CONN_STATUS
     LSCONN_ST_ERROR,
     LSCONN_ST_CLOSED,
     LSCONN_ST_PEER_GOING_AWAY,
+    LSCONN_ST_VERNEG_FAILURE,
 };
 
 enum LSQUIC_CONN_STATUS
@@ -2045,6 +2100,18 @@ lsquic_ver2str[N_LSQVER];
 /* Return connection associated with this SSL object */
 lsquic_conn_t *
 lsquic_ssl_to_conn (const struct ssl_st *);
+
+/* Return session resumption information that can be used on subsequenct
+ * connection as argument to lsquic_engine_connect().  Call from inside
+ * SSL's new session callback.
+ *
+ * Returns 0 on success.  In this case, `buf' is made to point to newly
+ * allocated memory containing `buf_sz' bytes.  It is the caller's
+ * responsibility to free the memory.
+ */
+int
+lsquic_ssl_sess_to_resume_info (struct ssl_st *, struct ssl_session_st *,
+                                        unsigned char **buf, size_t *buf_sz);
 
 #ifdef __cplusplus
 }

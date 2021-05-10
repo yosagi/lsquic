@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 /*
  * lsquic_engine.c - QUIC engine
  */
@@ -64,7 +64,6 @@
 #include "lsquic_sfcw.h"
 #include "lsquic_hash.h"
 #include "lsquic_conn.h"
-#include "lsquic_send_ctl.h"
 #include "lsquic_full_conn.h"
 #include "lsquic_util.h"
 #include "lsquic_qtags.h"
@@ -96,14 +95,15 @@
 #define LSQUIC_DEBUG_NEXT_ADV_TICK 1
 #endif
 
-#if LSQUIC_DEBUG_NEXT_ADV_TICK
+#if LSQUIC_DEBUG_NEXT_ADV_TICK || LSQUIC_CONN_STATS
 #include "lsquic_alarmset.h"
 #endif
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 /* The batch of outgoing packets grows and shrinks dynamically */
-/* Batch sizes must be powers of two */
+/* Batch sizes do not have to be powers of two */
 #define MAX_OUT_BATCH_SIZE 1024
 #define MIN_OUT_BATCH_SIZE 4
 #define INITIAL_OUT_BATCH_SIZE 32
@@ -247,6 +247,7 @@ struct lsquic_engine
     struct min_heap                    conns_out;
     struct eng_hist                    history;
     unsigned                           batch_size;
+    unsigned                           min_batch_size, max_batch_size;
     struct lsquic_conn                *curr_conn;
     struct pr_queue                   *pr_queue;
     struct attq                       *attq;
@@ -391,6 +392,7 @@ lsquic_engine_init_settings (struct lsquic_engine_settings *settings,
     settings->es_ptpc_err_thresh = LSQUIC_DF_PTPC_ERR_THRESH;
     settings->es_ptpc_err_divisor= LSQUIC_DF_PTPC_ERR_DIVISOR;
     settings->es_delay_onclose   = LSQUIC_DF_DELAY_ONCLOSE;
+    settings->es_check_tp_sanity = LSQUIC_DF_CHECK_TP_SANITY;
 }
 
 
@@ -479,6 +481,14 @@ lsquic_engine_check_settings (const struct lsquic_engine_settings *settings,
         if (err_buf)
             snprintf(err_buf, err_buf_sz, "mtu probe timer is too small: "
                 "%u ms", settings->es_mtu_probe_timer);
+        return -1;
+    }
+
+    if (settings->es_max_batch_size > MAX_OUT_BATCH_SIZE)
+    {
+        if (err_buf)
+            snprintf(err_buf, err_buf_sz, "max batch size is greater than "
+                "the allowed maximum of %u", (unsigned) MAX_OUT_BATCH_SIZE);
         return -1;
     }
 
@@ -606,7 +616,10 @@ lsquic_engine_new (unsigned flags,
     engine->pub.enp_get_ssl_ctx  = api->ea_get_ssl_ctx;
 
     if (api->ea_generate_scid)
+    {
         engine->pub.enp_generate_scid = api->ea_generate_scid;
+        engine->pub.enp_gen_scid_ctx  = api->ea_gen_scid_ctx;
+    }
     else
         engine->pub.enp_generate_scid = lsquic_generate_scid;
 
@@ -660,7 +673,7 @@ lsquic_engine_new (unsigned flags,
         {
             int sz = lsquic_enc_sess_ietf_gen_quic_ctx(
                         &engine->pub.enp_settings,
-                        i == 0 ? LSQVER_ID27 : LSQVER_ID28,
+                        i == 0 ? LSQVER_ID27 : LSQVER_ID29,
                         engine->pub.enp_quic_ctx_buf[i],
                         sizeof(engine->pub.enp_quic_ctx_buf));
             if (sz < 0)
@@ -699,7 +712,19 @@ lsquic_engine_new (unsigned flags,
     }
     engine->attq = lsquic_attq_create();
     eng_hist_init(&engine->history);
-    engine->batch_size = INITIAL_OUT_BATCH_SIZE;
+    if (engine->pub.enp_settings.es_max_batch_size)
+    {
+        engine->max_batch_size = engine->pub.enp_settings.es_max_batch_size;
+        engine->min_batch_size = MIN(4, engine->max_batch_size);
+        engine->batch_size = MAX(engine->max_batch_size / 4,
+                                                    engine->min_batch_size);
+    }
+    else
+    {
+        engine->min_batch_size = MIN_OUT_BATCH_SIZE;
+        engine->max_batch_size = MAX_OUT_BATCH_SIZE;
+        engine->batch_size = INITIAL_OUT_BATCH_SIZE;
+    }
     if (engine->pub.enp_settings.es_honor_prst)
     {
         engine->pub.enp_srst_hash = lsquic_hash_create();
@@ -799,14 +824,14 @@ log_packet_checksum (const lsquic_cid_t *cid, const char *direction,
 static void
 grow_batch_size (struct lsquic_engine *engine)
 {
-    engine->batch_size <<= engine->batch_size < MAX_OUT_BATCH_SIZE;
+    engine->batch_size = MIN(engine->batch_size * 2, engine->max_batch_size);
 }
 
 
 static void
 shrink_batch_size (struct lsquic_engine *engine)
 {
-    engine->batch_size >>= engine->batch_size > MIN_OUT_BATCH_SIZE;
+    engine->batch_size = MAX(engine->batch_size / 2, engine->min_batch_size);
 }
 
 
@@ -2882,6 +2907,8 @@ process_connections (lsquic_engine_t *engine, conn_iter_f next_conn,
         }
     }
 
+    cub_flush(&engine->new_scids);
+
     if ((engine->pub.enp_flags & ENPUB_CAN_SEND)
                         && lsquic_engine_has_unsent_packets(engine))
         send_packets_out(engine, &ticked_conns, &closed_conns);
@@ -2922,7 +2949,6 @@ process_connections (lsquic_engine_t *engine, conn_iter_f next_conn,
         }
     }
 
-    cub_flush(&engine->new_scids);
     cub_flush(&cub_live);
     cub_flush(&cub_old);
 }
@@ -3135,6 +3161,8 @@ lsquic_engine_earliest_adv_tick (lsquic_engine_t *engine, int *diff)
     lsquic_time_t now, next_time;
 #if LSQUIC_DEBUG_NEXT_ADV_TICK || LSQUIC_CONN_STATS
     struct lsquic_conn *conn;
+#endif
+#if LSQUIC_DEBUG_NEXT_ADV_TICK
     const enum lsq_log_level L = LSQ_LOG_DEBUG;  /* Easy toggle */
 #endif
 
@@ -3160,7 +3188,8 @@ lsquic_engine_earliest_adv_tick (lsquic_engine_t *engine, int *diff)
         return 1;
     }
 
-    if (engine->pr_queue && lsquic_prq_have_pending(engine->pr_queue))
+    if ((engine->pub.enp_flags & ENPUB_CAN_SEND)
+        && engine->pr_queue && lsquic_prq_have_pending(engine->pr_queue))
     {
 #if LSQUIC_DEBUG_NEXT_ADV_TICK
         engine->last_logged_conn = 0;

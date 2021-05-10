@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 #define _GNU_SOURCE         /* for memmem */
 
 #include <assert.h>
@@ -120,6 +120,7 @@ enum enc_sess_history_event
     ESHE_SNO_OK             =  'f',
     ESHE_MULTI2_2BITS       =  'i',
     ESHE_SNI_DELAYED        =  'Y',
+    ESHE_XLCT_MISMATCH      =  'x',
 };
 #endif
 
@@ -132,6 +133,7 @@ typedef struct hs_ctx_st
         HSET_SCID     =   (1 << 2),
         HSET_IRTT     =   (1 << 3),
         HSET_SRST     =   (1 << 4),
+        HSET_XLCT     =   (1 << 5),     /* xlct is set */
     }           set;
     enum {
         HOPT_NSTP     =   (1 << 0),     /* NSTP option present in COPT */
@@ -155,6 +157,7 @@ typedef struct hs_ctx_st
     uint32_t    tcid;
     uint32_t    smhl;
     uint64_t    sttl;
+    uint64_t    xlct;
     unsigned char scid[SCID_LENGTH];
     //unsigned char chlo_hash[32]; //SHA256 HASH of CHLO
     unsigned char nonc[DNONC_LENGTH]; /* 4 tm, 8 orbit ---> REJ, 20 rand */
@@ -281,6 +284,7 @@ struct lsquic_enc_session
     SSL_CTX *  ssl_ctx;
     struct lsquic_engine_public *enpub;
     struct lsquic_str * cert_ptr; /* pointer to the leaf cert of the server, not real copy */
+    uint64_t            cert_hash;
     struct lsquic_str   chlo; /* real copy of CHLO message */
     struct lsquic_str   sstk;
     struct lsquic_str   ssno;
@@ -308,6 +312,7 @@ typedef struct compress_cert_hash_item_st
 typedef struct cert_item_st
 {
     struct lsquic_str*      crt;
+    uint64_t                hash;   /* Hash of `crt' */
     struct lsquic_hash_elem hash_el;
     unsigned char           key[0];
 } cert_item_t;
@@ -533,6 +538,8 @@ insert_cert (struct lsquic_engine_public *enpub, const unsigned char *key,
 
     item->crt = crt_copy;
     memcpy(item->key, key, key_sz);
+    item->hash = lsquic_fnv1a_64((const uint8_t *)lsquic_str_buf(crt),
+                                                        lsquic_str_len(crt));
     el = lsquic_hash_insert(enpub->enp_server_certs, item->key, key_sz,
                                                         item, &item->hash_el);
     if (el)
@@ -1143,15 +1150,15 @@ static int parse_hs_data (struct lsquic_enc_session *enc_session, uint32_t tag,
         break;
 
     case QTAG_SCID:
-        if (len != SCID_LENGTH)
+        if (len < SCID_LENGTH)
             return -1;
         if (is_client)
         {
-            memcpy(enc_session->info->sscid, val, len);
+            memcpy(enc_session->info->sscid, val, SCID_LENGTH);
         }
         else
         {
-            memcpy(hs_ctx->scid, val, len);
+            memcpy(hs_ctx->scid, val, SCID_LENGTH);
             hs_ctx->set |= HSET_SCID;
         }
         ESHIST_APPEND(enc_session, ESHE_SET_SCID);
@@ -1262,6 +1269,17 @@ static int parse_hs_data (struct lsquic_enc_session *enc_session, uint32_t tag,
         memcpy(hs_ctx->srst, val, len);
         hs_ctx->set |= HSET_SRST;
         ESHIST_APPEND(enc_session, ESHE_SET_SRST);
+        break;
+
+    case QTAG_XLCT:
+        if (len != sizeof(hs_ctx->xlct))
+        {
+            LSQ_INFO("Unexpected size of XLCT: %u instead of %zu bytes",
+                len, sizeof(hs_ctx->xlct));
+            return -1;
+        }
+        hs_ctx->set |= HSET_XLCT;
+        hs_ctx->xlct = get_tag_value_i64(val, len);
         break;
 
     default:
@@ -1694,6 +1712,17 @@ determine_rtts (struct lsquic_enc_session *enc_session,
         goto fail_1rtt;
     }
 
+    if (hs_ctx->set & HSET_XLCT)
+    {
+        if (enc_session->cert_hash != hs_ctx->xlct)
+        {
+            /* The expected leaf certificate hash could not be validated. */
+            hs_ctx->rrej = HFR_INVALID_EXPECTED_LEAF_CERTIFICATE;
+            ESHIST_APPEND(enc_session, ESHE_XLCT_MISMATCH);
+            goto fail_1rtt;
+        }
+    }
+
     if (lsquic_str_len(&enc_session->ssno) > 0)
     {
         if (lsquic_str_len(&hs_ctx->sno) == 0)
@@ -1887,7 +1916,7 @@ get_valid_scfg (const struct lsquic_enc_session *enc_session,
 
 
 static int
-generate_crt (struct lsquic_enc_session *enc_session)
+generate_crt (struct lsquic_enc_session *enc_session, int common_case)
 {
     int i, n, len, crt_num, rv = -1;
     lsquic_str_t **crts;
@@ -1926,13 +1955,16 @@ generate_crt (struct lsquic_enc_session *enc_session)
     if (!ccert)
         goto cleanup;
 
-    if (SSL_CTX_set_ex_data(ctx, s_ccrt_idx, ccert))
-        ++ccert->refcnt;
-    else
+    if (common_case)
     {
-        free(ccert);
-        ccert = NULL;
-        goto cleanup;
+        if (SSL_CTX_set_ex_data(ctx, s_ccrt_idx, ccert))
+            ++ccert->refcnt;
+        else
+        {
+            free(ccert);
+            ccert = NULL;
+            goto cleanup;
+        }
     }
 
     ++ccert->refcnt;
@@ -1963,13 +1995,13 @@ gen_rej1_data (struct lsquic_enc_session *enc_session, uint8_t *data,
     int len;
     EVP_PKEY * rsa_priv_key;
     SSL_CTX *ctx = enc_session->ssl_ctx;
-    const struct lsquic_engine_settings *const settings =
-                                        &enc_session->enpub->enp_settings;
     hs_ctx_t *const hs_ctx = &enc_session->hs_ctx;
     int scfg_len = enc_session->server_config->lsc_scfg->info.scfg_len;
     uint8_t *scfg_data = enc_session->server_config->lsc_scfg->scfg;
+    int common_case;
     size_t msg_len;
     struct message_writer mw;
+    uint64_t sttl;
 
     rsa_priv_key = SSL_CTX_get0_privatekey(ctx);
     if (!rsa_priv_key)
@@ -1990,13 +2022,21 @@ gen_rej1_data (struct lsquic_enc_session *enc_session, uint8_t *data,
         hs_ctx->ccert = NULL;
     }
 
-    hs_ctx->ccert = SSL_CTX_get_ex_data(ctx, s_ccrt_idx);
+    /**
+     * Only cache hs_ctx->ccs is the hardcoded common certs and hs_ctx->ccrt is empty case
+     * This is the most common case
+     */
+    common_case = lsquic_str_len(&hs_ctx->ccrt) == 0
+               && lsquic_str_bcmp(&hs_ctx->ccs, lsquic_get_common_certs_hash()) == 0;
+    if (common_case)
+        hs_ctx->ccert = SSL_CTX_get_ex_data(ctx, s_ccrt_idx);
+
     if (hs_ctx->ccert)
     {
         ++hs_ctx->ccert->refcnt;
         LSQ_DEBUG("use cached compressed cert");
     }
-    else if (0 == generate_crt(enc_session))
+    else if (0 == generate_crt(enc_session, common_case))
         LSQ_DEBUG("generated compressed cert");
     else
     {
@@ -2029,7 +2069,7 @@ gen_rej1_data (struct lsquic_enc_session *enc_session, uint8_t *data,
     MSG_LEN_ADD(msg_len, scfg_len);
     MSG_LEN_ADD(msg_len, STK_LENGTH);
     MSG_LEN_ADD(msg_len, SNO_LENGTH);
-    MSG_LEN_ADD(msg_len, sizeof(settings->es_sttl));
+    MSG_LEN_ADD(msg_len, sizeof(sttl));
     MSG_LEN_ADD(msg_len, lsquic_str_len(&hs_ctx->prof));
     if (hs_ctx->ccert)
         MSG_LEN_ADD(msg_len, hs_ctx->ccert->len);
@@ -2055,6 +2095,8 @@ gen_rej1_data (struct lsquic_enc_session *enc_session, uint8_t *data,
         lsquic_str_setlen(&enc_session->ssno, SNO_LENGTH);
     }
     RAND_bytes((uint8_t *) lsquic_str_buf(&enc_session->ssno), SNO_LENGTH);
+    sttl = enc_session->enpub->enp_server_config->lsc_scfg->info.expy
+                                                    - (uint64_t) time(NULL);
 
     MW_BEGIN(&mw, QTAG_REJ, 7, data);
     MW_WRITE_LS_STR(&mw, QTAG_STK, &enc_session->sstk);
@@ -2062,8 +2104,7 @@ gen_rej1_data (struct lsquic_enc_session *enc_session, uint8_t *data,
     MW_WRITE_LS_STR(&mw, QTAG_PROF, &hs_ctx->prof);
     MW_WRITE_BUFFER(&mw, QTAG_SCFG, scfg_data, scfg_len);
     MW_WRITE_BUFFER(&mw, QTAG_RREJ, &hs_ctx->rrej, sizeof(hs_ctx->rrej));
-    MW_WRITE_BUFFER(&mw, QTAG_STTL, &settings->es_sttl,
-                                                sizeof(settings->es_sttl));
+    MW_WRITE_BUFFER(&mw, QTAG_STTL, &sttl, sizeof(sttl));
     if (hs_ctx->ccert)
         MW_WRITE_BUFFER(&mw, QTAG_CRT, hs_ctx->ccert->buf, hs_ctx->ccert->len);
     MW_END(&mw);
@@ -2264,6 +2305,7 @@ get_sni_SSL_CTX(struct lsquic_enc_session *enc_session, lsquic_lookup_cert_f cb,
                 }
             }
             enc_session->cert_ptr = item->crt;
+            enc_session->cert_hash = item->hash;
         }
         else
         {
@@ -2277,6 +2319,9 @@ get_sni_SSL_CTX(struct lsquic_enc_session *enc_session, lsquic_lookup_cert_f cb,
             if (!enc_session->cert_ptr)
                 return GET_SNI_ERR;
             enc_session->es_flags |= ES_FREE_CERT_PTR;
+            enc_session->cert_hash = lsquic_fnv1a_64(
+                (const uint8_t *) lsquic_str_buf(enc_session->cert_ptr),
+                lsquic_str_len(enc_session->cert_ptr));
         }
     }
     return GET_SNI_OK;
@@ -2321,9 +2366,6 @@ handle_chlo_frames_data(const uint8_t *data, int len,
     }
 
 
-    rtt = determine_rtts(enc_session, ip, t);
-    ESHIST_APPEND(enc_session, ESHE_MULTI2_2BITS + rtt);
-    lsquic_str_setto(&enc_session->chlo, (const char *)data, len);
     switch (get_sni_SSL_CTX(enc_session, cb, cb_ctx, local))
     {
     case GET_SNI_ERR:
@@ -2334,6 +2376,9 @@ handle_chlo_frames_data(const uint8_t *data, int len,
         break;
     }
 
+    rtt = determine_rtts(enc_session, ip, t);
+    ESHIST_APPEND(enc_session, ESHE_MULTI2_2BITS + rtt);
+    lsquic_str_setto(&enc_session->chlo, (const char *)data, len);
 
     LSQ_DEBUG("handle_chlo_frames_data return %d.", rtt);
     return rtt;
@@ -3502,6 +3547,14 @@ lsquic_enc_session_get_ua (enc_session_t *enc_session_p)
 }
 
 
+static const char *
+lsquic_enc_session_get_sni (enc_session_t *enc_session_p)
+{
+    struct lsquic_enc_session *const enc_session = enc_session_p;
+    return lsquic_str_cstr(&enc_session->hs_ctx.sni);
+}
+
+
 #ifndef NDEBUG
 static uint8_t
 lsquic_enc_session_have_key (enc_session_t *enc_session_p)
@@ -3819,6 +3872,7 @@ struct enc_session_funcs_common lsquic_enc_session_common_gquic_1 =
     .esf_cipher = lsquic_enc_session_cipher,
     .esf_keysize = lsquic_enc_session_keysize,
     .esf_alg_keysize = lsquic_enc_session_alg_keysize,
+    .esf_get_sni = lsquic_enc_session_get_sni,
     .esf_encrypt_packet = gquic_encrypt_packet,
     .esf_decrypt_packet = gquic_decrypt_packet,
     .esf_tag_len = GQUIC_PACKET_HASH_SZ,
@@ -4246,6 +4300,7 @@ const
 /* Q050 and later */
 struct enc_session_funcs_common lsquic_enc_session_common_gquic_2 =
 {
+    .esf_get_sni                =  lsquic_enc_session_get_sni,
     .esf_global_init            =  lsquic_handshake_init,
     .esf_global_cleanup         =  lsquic_handshake_cleanup,
     .esf_cipher                 =  lsquic_enc_session_cipher,

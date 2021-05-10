@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 /*
  * lsquic_conn.h -- Connection interface
  *
@@ -393,7 +393,7 @@ void
 lsquic_generate_cid_gquic (lsquic_cid_t *cid);
 
 void
-lsquic_generate_scid (struct lsquic_conn *lconn, lsquic_cid_t *scid,
+lsquic_generate_scid (void *, struct lsquic_conn *lconn, lsquic_cid_t *scid,
                                                                 unsigned len);
 
 void

@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 // Copyright 2016 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE.chrome file.
@@ -344,10 +344,12 @@ lsquic_bbr_ack (void *cong_ctl, struct lsquic_packet_out *packet_out,
     if (sample)
         TAILQ_INSERT_TAIL(&bbr->bbr_ack_state.samples, sample, next);
 
-    if (is_valid_packno(bbr->bbr_ack_state.max_packno))
-        /* We assume packet numbers are ordered */
-        assert(packet_out->po_packno > bbr->bbr_ack_state.max_packno);
-    bbr->bbr_ack_state.max_packno = packet_out->po_packno;
+    if (!is_valid_packno(bbr->bbr_ack_state.max_packno)
+                /* Packet ordering is checked for, and warned about, in
+                 * lsquic_senhist_add().
+                 */
+            || packet_out->po_packno > bbr->bbr_ack_state.max_packno)
+        bbr->bbr_ack_state.max_packno = packet_out->po_packno;
     bbr->bbr_ack_state.acked_bytes += packet_sz;
 }
 

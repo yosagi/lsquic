@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 #ifndef LSQUIC_STREAM_H
 #define LSQUIC_STREAM_H
 
@@ -109,6 +109,9 @@ struct hq_filter
         HQFI_FLAG_ERROR         = 1 << 1,
         HQFI_FLAG_BEGIN         = 1 << 2,
         HQFI_FLAG_BLOCKED       = 1 << 3,
+        HQFI_FLAG_HEADER        = 1 << 4,
+        HQFI_FLAG_DATA          = 1 << 5,
+        HQFI_FLAG_TRAILER       = 1 << 6,
     }                           hqfi_flags:8;
     enum {
         HQFI_STATE_FRAME_HEADER_BEGIN,
@@ -117,9 +120,6 @@ struct hq_filter
         HQFI_STATE_PUSH_ID_BEGIN,
         HQFI_STATE_PUSH_ID_CONTINUE,
     }                           hqfi_state:8;
-    unsigned char               hqfi_hist_idx;
-#define MAX_HQFI_ENTRIES (sizeof(unsigned) * 8 / 3)
-    unsigned                    hqfi_hist_buf;
 };
 
 
@@ -510,10 +510,7 @@ void
 lsquic_stream_stream_frame_sent (lsquic_stream_t *);
 
 void
-lsquic_stream_reset (lsquic_stream_t *, uint64_t error_code);
-
-void
-lsquic_stream_reset_ext (lsquic_stream_t *, uint64_t error_code, int close);
+lsquic_stream_maybe_reset (struct lsquic_stream *, uint64_t error_code, int);
 
 void
 lsquic_stream_call_on_close (lsquic_stream_t *);

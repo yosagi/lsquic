@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 /*
  * md5_client.c -- This client sends one or more files to MD5 QUIC server
  *                 for MD5 sum calculation.
@@ -273,7 +273,9 @@ client_file_on_write_buf (lsquic_stream_ctx_t *st_h)
     if (g_reset_stream.stream_id == lsquic_stream_id(st_h->stream) &&
         lseek(st_h->file->fd, 0, SEEK_CUR) >= g_reset_stream.offset)
     {
-        lsquic_stream_reset(st_h->stream, 0x01    /* QUIC_INTERNAL_ERROR */);
+        /* Note: this is an internal function */
+        lsquic_stream_maybe_reset(st_h->stream,
+                0x01 /* QUIC_INTERNAL_ERROR */, 1);
         g_reset_stream.stream_id = 0;   /* Reset only once */
     }
 

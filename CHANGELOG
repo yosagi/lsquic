@@ -1,3 +1,135 @@
+2021-04-20
+    - 2.30.2
+    - Update ls-hpack to 2.3.0 to address dynamic table size limit (issue #260).
+
+2021-04-16
+    - 2.30.1
+    - Fixed an unintialized data member for handling pushed headers.
+    - Added a new status code for version negotiation failure.
+    - Fixed a few compliance issues found by h3spec.
+    - Addressed high CPU usage when transport cannot send pending packets.
+
+2021-04-12
+    - 2.30.0
+    - Added support for sending/receiving multiple headers to address the
+      case related to "100 continue" header handling.
+    - Addressed high CPU usage for a GOAWAY connection before sending
+      CONNECTION_CLOSE.
+    - Addressed SIGFPE due to zero pacing rate. (ISSUE #254).
+    - Fixed a minor issue related to multi-paths.
+
+2021-03-31
+    - 2.29.6
+    - Documentation: describe lsquic internals ("guts").
+    - Two more fixes to compliance issues found by h3spec.
+    - Truncate, don't abort, SCIDs larger than 16 bytes (PR #244).
+    - Several small internal improvements and space optimizations.
+
+2021-03-17
+    - 2.29.5
+    - Fix a few issues detected by h3spec for better compliance with HTTP/3
+      standard.
+
+2021-03-08
+    - 2.29.4
+    - [BUGFIX] Infinite loop in stream: returned HQ frame can be at any
+      point on the list.
+    - [BUGFIX] Fail push promise immediately if STREAM_NOPUSH is set.
+
+2021-03-03
+    - 2.29.3
+    - [BUGFIX] Do not send RESET_STREAM if writing to stream is already
+      finished.
+    - perf_client: wait for all ACKs before exiting.
+    - Improve how generated RESET_STREAM is logged.
+    - Fix compilation in different combos of adv_tick/conn_stats flags.
+    - Move qpack warning disablement into src/liblsquic/CMakeLists.txt.
+
+2021-02-23
+    - 2.29.2
+    - Fix regression in gQUIC server: bug #234.
+
+2021-02-18
+    - 2.29.1
+    - Make it possible to build the library and unit tests without
+      libevent.
+    - Build all command-line utilities in bin/
+    - Add perf_client and perf_server command-line utilities to test
+      performance according to the "perf" protocol.
+
+2021-02-10
+    - 2.29.0
+    - [FEATURE] QUIC and HTTP/3 Internet Draft 34 support and v1 support.
+      The latter is turned off by default.
+    - Drop support for ID-28 and ID-32.
+    - [BUGFIX] IETF QUIC mini conn receive history (trechist): allow
+      unlimited inserts by dropping smallest elements.
+    - [BUGFIX] gQUIC: set STTL to correct value, issue #226.
+    - [BUGFIX] Account for poison packet gap when MTU probe was too large.
+
+2021-02-03
+    - 2.28.0
+    - [API] lsquic_ssl_sess_to_resume_info() is the new way to get
+      session info.
+    - [API] Add user pointer to ea_generate_scid callback.
+    - [API] Add lsquic_dcid_from_packet() -- a fast function to parse
+      out DCID.
+    - [API] Add es_max_batch_size to control outgoing packet batch size.
+    - [BUGFIX] Disallow sending of header while promise is being written.
+    - [BUGFIX] Flush stream when buffered bytes exhaust stream cap.
+    - [BUGFIX] Deactivate HQ frame if writing push promise fails.
+    - Perform sanity check on peer transport parameters and fail the
+      handshake if some flow control limits are too low.  This can be
+      turned off, see es_check_tp_sanity.
+    - http_server: fix how requests are read in "hq" mode.
+
+2021-01-27
+    - 2.27.6
+    - [BUGFIX] Replace dispatch read/write events assertion with a check.
+    - [BUGFIX] gQUIC connection close: there is no HEADERS stream without
+      HTTP flag, see issue #220.
+    - http_client, http_server: add hq protocol support and other flags
+      for use with QUIC Interop Runner.
+    - Fix: use IP_PMTUDISC_PROBE (not IP_PMTUDISC_DO) on Linux to set
+      Don't-Fragment flag on outgoing packets.
+    - Fix send_packets_one_by_one on Windows platform when sending
+      multiple iovs, see issue #218.
+    - Exit echo_client on Windows immediately, see issue #219.
+
+2021-01-18
+    - 2.27.5
+    - [BUGFIX] Assertion in send controller when path validation fails.
+    - [BUGFIX] Assertion in BBR when sending out-of-order packets is
+      detected.
+    - [BUGFIX] Drop overflow receive history ranges when cloning.
+    - Log correct size of the incoming packet.
+    - Fix internal stream function.
+
+2021-01-13
+    - 2.27.4
+    - [API] Add lsquic_conn_get_sni(), fixes issue #203.
+
+2021-01-08
+    - 2.27.3
+    - [BUGFIX] gQUIC: do not destroy critical streams when connection is
+      closed.  See issue #201.
+    - [BUGFIX] Drop #if LSQUIC_CONN_STATS from lsquic.h.  See issue #211.
+    - [BUGFIX] Challenge cancellation when path validation fails.
+    - [BUGFIX] Do not send FIN if RST is scheduled to be sent on a stream.
+    - [BUGFIX] gQUIC's is_tickable() when connection is closing.
+    - [BUGFIX] Q050 processing of GOAWAY frames.
+
+2021-01-06
+    - 2.27.2
+    - [BUGFIX] Memory corruption in receive history copy-ranges function.
+
+2021-01-06
+    - 2.27.1
+    - [API] New knob to set outgoing packet batch size.
+    - Aborted connection now become tickable immediately.
+    - Abort connection when HTTP/3 frame cannot be opened (can only happen
+      when malloc fails).
+
 2020-12-31
     - 2.27.0
     - [API] Remove keylog callbacks.  See issue #188.

@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 /*
  * http_server.c -- A simple HTTP/QUIC server
  *
@@ -321,6 +321,11 @@ static lsquic_conn_ctx_t *
 http_server_on_new_conn (void *stream_if_ctx, lsquic_conn_t *conn)
 {
     struct server_ctx *server_ctx = stream_if_ctx;
+    const char *sni;
+
+    sni = lsquic_conn_get_sni(conn);
+    LSQ_DEBUG("new connection, SNI: %s", sni ? sni : "<not set>");
+
     lsquic_conn_ctx_t *conn_h = malloc(sizeof(*conn_h));
     conn_h->conn = conn;
     conn_h->server_ctx = server_ctx;
@@ -413,6 +418,11 @@ struct req
     enum {
         HAVE_XHDR   = 1 << 0,
     }            flags;
+    enum {
+        PH_AUTHORITY    = 1 << 0,
+        PH_METHOD       = 1 << 1,
+        PH_PATH         = 1 << 2,
+    }            pseudo_headers;
     char        *path;
     char        *method_str;
     char        *authority_str;
@@ -1061,6 +1071,123 @@ const struct lsquic_stream_if http_server_if = {
 };
 
 
+#if HAVE_OPEN_MEMSTREAM
+static void
+hq_server_on_read (struct lsquic_stream *stream, lsquic_stream_ctx_t *st_h)
+{
+    char tbuf[0x100], *buf;
+    ssize_t nread;
+    char *path, *end, *filename;
+
+    if (!st_h->req_fh)
+        st_h->req_fh = open_memstream(&st_h->req_buf, &st_h->req_sz);
+
+    nread = lsquic_stream_read(stream, tbuf, sizeof(tbuf));
+    if (nread > 0)
+    {
+        fwrite(tbuf, 1, nread, st_h->req_fh);
+        return;
+    }
+
+    if (nread < 0)
+    {
+        LSQ_WARN("error reading request from stream: %s", strerror(errno));
+        lsquic_stream_close(stream);
+        return;
+    }
+
+    fwrite("", 1, 1, st_h->req_fh);
+    fclose(st_h->req_fh);
+    LSQ_INFO("got request: `%.*s'", (int) st_h->req_sz, st_h->req_buf);
+
+    buf = st_h->req_buf;
+    path = strchr(buf, ' ');
+    if (!path)
+    {
+        LSQ_WARN("invalid request (no space character): `%s'", buf);
+        lsquic_stream_close(stream);
+        return;
+    }
+    if (!(path - buf == 3 && 0 == strncasecmp(buf, "GET", 3)))
+    {
+        LSQ_NOTICE("unsupported method `%.*s'", (int) (path - buf), buf);
+        lsquic_stream_close(stream);
+        return;
+    }
+    ++path;
+    for (end = buf + st_h->req_sz - 1; end > path
+                && (*end == '\0' || *end == '\r' || *end == '\n'); --end)
+        *end = '\0';
+    LSQ_NOTICE("parsed out request path: %s", path);
+
+    filename = malloc(strlen(st_h->server_ctx->document_root) + 1 + strlen(path) + 1);
+    strcpy(filename, st_h->server_ctx->document_root);
+    strcat(filename, "/");
+    strcat(filename, path);
+    LSQ_NOTICE("file to fetch: %s", filename);
+    /* XXX This copy pasta is getting a bit annoying now: two mallocs of the
+     * same thing?
+     */
+    st_h->req_filename = filename;
+    st_h->req_path = strdup(filename);
+    st_h->reader.lsqr_read = test_reader_read;
+    st_h->reader.lsqr_size = test_reader_size;
+    st_h->reader.lsqr_ctx = create_lsquic_reader_ctx(st_h->req_path);
+    if (!st_h->reader.lsqr_ctx)
+    {
+        lsquic_stream_close(stream);
+        return;
+    }
+    lsquic_stream_shutdown(stream, 0);
+    lsquic_stream_wantwrite(stream, 1);
+}
+
+
+static void
+hq_server_on_write (struct lsquic_stream *stream, lsquic_stream_ctx_t *st_h)
+{
+    ssize_t nw;
+
+    nw = lsquic_stream_writef(stream, &st_h->reader);
+    if (nw < 0)
+    {
+        struct lsquic_conn *conn = lsquic_stream_conn(stream);
+        lsquic_conn_ctx_t *conn_h = lsquic_conn_get_ctx(conn);
+        if (conn_h->flags & RECEIVED_GOAWAY)
+        {
+            LSQ_NOTICE("cannot write: goaway received");
+            lsquic_stream_close(stream);
+        }
+        else
+        {
+            LSQ_ERROR("write error: %s", strerror(errno));
+            lsquic_stream_close(stream);
+        }
+    }
+    else if (bytes_left(st_h) > 0)
+    {
+        st_h->written += (size_t) nw;
+        lsquic_stream_wantwrite(stream, 1);
+    }
+    else
+    {
+        lsquic_stream_shutdown(stream, 1);
+        lsquic_stream_wantread(stream, 1);
+    }
+}
+
+
+const struct lsquic_stream_if hq_server_if = {
+    .on_new_conn            = http_server_on_new_conn,
+    .on_conn_closed         = http_server_on_conn_closed,
+    .on_new_stream          = http_server_on_new_stream,
+    .on_read                = hq_server_on_read,
+    .on_write               = hq_server_on_write,
+    .on_close               = http_server_on_close,
+};
+#endif
+
+
 #if HAVE_REGEX
 struct req_map
 {
@@ -1650,6 +1777,7 @@ usage (const char *prog)
 "                 Incompatible with -w.\n"
 #endif
 "   -y DELAY    Delay response for this many seconds -- use for debugging\n"
+"   -Q ALPN     Use hq mode; ALPN could be \"hq-29\", for example.\n"
             , prog);
 }
 
@@ -1706,7 +1834,16 @@ interop_server_hset_add_header (void *hset_p, struct lsxpack_header *xhdr)
     unsigned name_len, value_len;
 
     if (!xhdr)
-        return 0;
+    {
+        if (req->pseudo_headers == (PH_AUTHORITY|PH_METHOD|PH_PATH))
+            return 0;
+        else
+        {
+            LSQ_INFO("%s: missing some pseudo-headers: 0x%X", __func__,
+                req->pseudo_headers);
+            return 1;
+        }
+    }
 
     name = lsxpack_header_get_name(xhdr);
     value = lsxpack_header_get_value(xhdr);
@@ -1733,6 +1870,7 @@ interop_server_hset_add_header (void *hset_p, struct lsxpack_header *xhdr)
         req->path = strndup(value, value_len);
         if (!req->path)
             return -1;
+        req->pseudo_headers |= PH_PATH;
         return 0;
     }
 
@@ -1749,6 +1887,7 @@ interop_server_hset_add_header (void *hset_p, struct lsxpack_header *xhdr)
             req->method = POST;
         else
             req->method = UNSUPPORTED;
+        req->pseudo_headers |= PH_METHOD;
         return 0;
     }
 
@@ -1757,6 +1896,7 @@ interop_server_hset_add_header (void *hset_p, struct lsxpack_header *xhdr)
         req->authority_str = strndup(value, value_len);
         if (!req->authority_str)
             return -1;
+        req->pseudo_headers |= PH_AUTHORITY;
         return 0;
     }
 
@@ -1806,7 +1946,11 @@ main (int argc, char **argv)
     prog_init(&prog, LSENG_SERVER|LSENG_HTTP, &server_ctx.sports,
                                             &http_server_if, &server_ctx);
 
-    while (-1 != (opt = getopt(argc, argv, PROG_OPTS "y:Y:n:p:r:w:P:h")))
+    while (-1 != (opt = getopt(argc, argv, PROG_OPTS "y:Y:n:p:r:w:P:h"
+#if HAVE_OPEN_MEMSTREAM
+                                                    "Q:"
+#endif
+                                                                        )))
     {
         switch (opt) {
         case 'n':
@@ -1849,6 +1993,14 @@ main (int argc, char **argv)
             usage(argv[0]);
             prog_print_common_options(&prog, stdout);
             exit(0);
+#if HAVE_OPEN_MEMSTREAM
+        case 'Q':
+            /* XXX A bit hacky, as `prog' has already been initialized... */
+            prog.prog_engine_flags &= ~LSENG_HTTP;
+            prog.prog_api.ea_stream_if = &hq_server_if;
+            add_alpn(optarg);
+            break;
+#endif
         default:
             if (0 != prog_set_opt(&prog, opt, optarg))
                 exit(1);

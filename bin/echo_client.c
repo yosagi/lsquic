@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 /*
  * echo_client.c -- This is really a "line client:" it connects to QUIC server
  * and sends it stuff, line by line.  It works in tandem with echo_server.
@@ -207,6 +207,12 @@ main (int argc, char **argv)
     struct sport_head sports;
     struct prog prog;
     struct echo_client_ctx client_ctx;
+
+#ifdef WIN32
+    fprintf(stderr, "%s does not work on Windows, see\n"
+        "https://github.com/litespeedtech/lsquic/issues/219\n", argv[0]);
+    exit(EXIT_FAILURE);
+#endif
 
     memset(&client_ctx, 0, sizeof(client_ctx));
     client_ctx.prog = &prog;

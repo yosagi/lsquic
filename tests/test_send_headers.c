@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 /*
  * test_send_headers.c -- Test what happens when lsquic_stream_send_headers()
  * is called.
@@ -174,7 +174,9 @@ static const struct conn_iface our_conn_if =
 
 static struct http1x_ctor_ctx ctor_ctx = { .is_server = 0, };
 
+#if LSQUIC_CONN_STATS
 static struct conn_stats s_conn_stats;
+#endif
 
 static void
 init_test_objs (struct test_objs *tobjs, unsigned initial_conn_window,
@@ -204,7 +206,9 @@ init_test_objs (struct test_objs *tobjs, unsigned initial_conn_window,
     tobjs->conn_pub.packet_out_malo =
                         lsquic_malo_create(sizeof(struct lsquic_packet_out));
     tobjs->conn_pub.path = &network_path;
+#if LSQUIC_CONN_STATS
     tobjs->conn_pub.conn_stats = &s_conn_stats;
+#endif
     tobjs->initial_stream_window = initial_stream_window;
     lsquic_send_ctl_init(&tobjs->send_ctl, &tobjs->alset, &tobjs->eng_pub,
         &tobjs->ver_neg, &tobjs->conn_pub, 0);
@@ -527,7 +531,8 @@ test_pp_wantwrite_restoration (const int want_write)
     lsquic_stream_window_update(stream, 100);
     lsquic_stream_dispatch_write_events(stream);
     assert((stream->stream_flags & (STREAM_NOPUSH|STREAM_PUSHING))
-                                        == (STREAM_NOPUSH|STREAM_PUSHING));
+        /* After push promise was all written, STREAM_PUSHING is no longer set */
+                                        == STREAM_NOPUSH);
     assert(SLIST_FIRST(&stream->sm_promises)->pp_write_state == PPWS_DONE); /* Done! */
     assert(want_write == s_onwrite_called); /* Restored: and on_write called */
 

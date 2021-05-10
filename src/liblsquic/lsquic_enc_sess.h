@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 #ifndef LSQUIC_ENC_SESS_H
 #define LSQUIC_ENC_SESS_H 1
 
@@ -98,6 +98,9 @@ struct enc_session_funcs_common
 
     int
     (*esf_alg_keysize) (enc_session_t *);
+
+    const char *
+    (*esf_get_sni) (enc_session_t *);
 
     /* Need to pass lconn in encrypt and decrypt methods because enc_session
      * is allowed to be NULL for gQUIC.
@@ -295,7 +298,7 @@ struct enc_session_funcs_iquic
                            void *(crypto_streams)[4],
                            const struct crypto_stream_if *,
                            const struct lsquic_cid *odcid,
-                           const struct lsquic_cid *iscid );
+                           const struct lsquic_cid *iscid);
 
     void
     (*esfi_shake_stream)(enc_session_t *, struct lsquic_stream *,
@@ -336,9 +339,9 @@ extern const struct enc_session_funcs_iquic lsquic_enc_session_iquic_ietf_v1;
 
 #define select_esf_common_by_ver(ver) ( \
     ver == LSQVER_ID27 ? &lsquic_enc_session_common_ietf_v1 : \
-    ver == LSQVER_ID28 ? &lsquic_enc_session_common_ietf_v1 : \
     ver == LSQVER_ID29 ? &lsquic_enc_session_common_ietf_v1 : \
-    ver == LSQVER_ID32 ? &lsquic_enc_session_common_ietf_v1 : \
+    ver == LSQVER_ID34 ? &lsquic_enc_session_common_ietf_v1 : \
+    ver == LSQVER_I001 ? &lsquic_enc_session_common_ietf_v1 : \
     ver == LSQVER_VERNEG ? &lsquic_enc_session_common_ietf_v1 : \
     ver == LSQVER_050 ? &lsquic_enc_session_common_gquic_2 : \
     &lsquic_enc_session_common_gquic_1 )

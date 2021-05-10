@@ -1,4 +1,4 @@
-/* Copyright (c) 2017 - 2020 LiteSpeed Technologies Inc.  See LICENSE. */
+/* Copyright (c) 2017 - 2021 LiteSpeed Technologies Inc.  See LICENSE. */
 /*
  * lsquic_alarmset.c -- A set of alarms
  */
@@ -45,6 +45,8 @@ const char *const lsquic_alid2str[] =
     [AL_CID_THROT]  =  "CID_THROT",
     [AL_PATH_CHAL_0] = "PATH_CHAL_0",
     [AL_PATH_CHAL_1] = "PATH_CHAL_1",
+    [AL_PATH_CHAL_2] = "PATH_CHAL_2",
+    [AL_PATH_CHAL_3] = "PATH_CHAL_3",
     [AL_SESS_TICKET] = "SESS_TICKET",
     [AL_BLOCKED_KA] = "BLOCKED_KA",
     [AL_MTU_PROBE]  = "MTU_PROBE",
